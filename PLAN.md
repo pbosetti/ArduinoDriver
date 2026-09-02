@@ -18,26 +18,35 @@ Findings from the installed cores (`~/Library/Arduino15/packages/arduino/hardwar
 
 ## Repository layout
 
+Restructured on 2026-09-03 so the repository root *is* the Arduino library
+(`library.properties`, `src/`, `examples/` at the top), which is what the
+Arduino Library Manager indexes. The host driver moved to `extras/`, a
+directory the Arduino tooling ignores by specification, so it is never
+compiled into a sketch. `CMakeLists.txt` stays at the root so the driver is
+still consumable with `FetchContent(GIT_REPOSITORY ...)` unchanged. Sections
+below that predate the move still name the old paths (`arduino/UsbIo/**` for
+the library, `driver/**` for the host side); they are kept as written, since
+they record what was done at the time.
+
 ```
-ArduinoDriver/
-  CMakeLists.txt                 # thin root: add_subdirectory(driver) + optional firmware-* targets (arduino-cli)
+ArduinoDriver/                   # this repository IS the UsbIo library
+  library.properties
+  CMakeLists.txt                 # root: add_subdirectory(extras/driver) + optional firmware-* targets (arduino-cli)
   README.md                      # protocol, per-board notes, bring-up checklist, udev/Windows notes
-  arduino/UsbIo/                 # Arduino LIBRARY (so the protocol header is shared + one example sketch)
-    library.properties
-    src/usbio_protocol.h         # C-compatible, freestanding: request codes, structs, status codes, board ids — SINGLE SOURCE OF TRUTH
-    src/UsbIo.h / UsbIo.cpp      # board-agnostic: command queue, shadow state, capability table, dispatcher
-    src/UsbIoBoard.h             # per-arch capability discovery (pin counts, digitalPinHasPWM, DAC pins, adc/pwm bits, vref)
-    src/transport/UsbIoTransport.h        # tiny internal interface: handle_setup(request) → {action, data, len}
-    src/transport/tinyusb_renesas.cpp     # #if ARDUINO_ARCH_RENESAS_UNO   — tud_vendor_control_xfer_cb
-    src/transport/tinyusb_rp2040.cpp      # #if ARDUINO_ARCH_RP2040        — same weak callback (UNVERIFIED)
-    src/transport/esp32_vendor.cpp        # #if ARDUINO_ARCH_ESP32 && ARDUINO_USB_MODE — USBVendor::onRequest (UNVERIFIED)
-    src/transport/pluggable_samd.cpp      # #if ARDUINO_ARCH_SAMD          — PluggableUSBModule w/ vendor interface
-    src/transport/pluggable_mbed.cpp      # #if ARDUINO_ARCH_MBED          — internal::PluggableUSBModule w/ vendor interface
-    examples/UsbIoDevice/UsbIoDevice.ino  # setup(){UsbIo.begin();} loop(){UsbIo.poll();}
-  driver/
+  src/usbio_protocol.h           # C-compatible, freestanding: request codes, structs, status codes, board ids — SINGLE SOURCE OF TRUTH
+  src/UsbIo.h / UsbIo.cpp        # board-agnostic: command queue, shadow state, capability table, dispatcher
+  src/UsbIoBoard.h               # per-arch capability discovery (pin counts, digitalPinHasPWM, DAC pins, adc/pwm bits, vref)
+  src/transport/UsbIoTransport.h        # tiny internal interface: handle_setup(request) → {action, data, len}
+  src/transport/tinyusb_renesas.cpp     # #if ARDUINO_ARCH_RENESAS_UNO   — tud_vendor_control_xfer_cb
+  src/transport/tinyusb_rp2040.cpp      # #if ARDUINO_ARCH_RP2040        — same weak callback (UNVERIFIED)
+  src/transport/esp32_vendor.cpp        # #if ARDUINO_ARCH_ESP32 && ARDUINO_USB_MODE — USBVendor::onRequest (UNVERIFIED)
+  src/transport/pluggable_samd.cpp      # #if ARDUINO_ARCH_SAMD          — PluggableUSBModule w/ vendor interface + bulk IN
+  src/transport/pluggable_mbed.cpp      # #if ARDUINO_ARCH_MBED          — internal::PluggableUSBModule w/ vendor interface + bulk IN
+  examples/UsbIoDevice/UsbIoDevice.ino  # setup(){UsbIo.begin();} loop(){UsbIo.poll();}
+  extras/driver/                 # host side; ignored by the Arduino toolchain
     CMakeLists.txt               # project ArduinoDriver, C++20, FetchContent: libusb-cmake, fmt, cxxopts, Catch2 v3
-    include/arduino_driver/{Protocol.h,Errors.h,Transport.h,LibusbTransport.h,Enumerator.h,Device.h}
-    src/{LibusbTransport.cpp,Enumerator.cpp,Device.cpp}
+    include/arduino_driver/{Protocol.h,Errors.h,Transport.h,LibusbTransport.h,Enumerator.h,Device.h,Stream.h}
+    src/{LibusbTransport.cpp,Enumerator.cpp,Device.cpp,Stream.cpp}
     tools/arduino-io.cpp         # CLI (cxxopts + fmt)
     tests/{CMakeLists.txt,FakeTransport.h,FakeTransport.cpp,test_*.cpp}
     etc/99-arduino-usbio.rules   # Linux udev

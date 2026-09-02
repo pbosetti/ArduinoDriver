@@ -1,12 +1,32 @@
 cmake_minimum_required(VERSION 3.24)
 project(ArduinoDriverWorkspace LANGUAGES NONE)
 
+# The repository root is the Arduino library itself (library.properties, src/,
+# examples/), so the library can be installed and published as-is. Everything
+# the Arduino IDE must ignore lives under extras/ - including the host driver,
+# which the Library Manager therefore never compiles into a sketch.
+#
+# This file stays at the root so the driver remains consumable with
+# FetchContent(GIT_REPOSITORY ...) without pointing at a subdirectory.
+
 # ---- Host driver (C++20) --------------------------------------------------
-# driver/ is a self-contained CMake project; it can also be configured alone
-# with `cmake -S driver -B build`.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/driver/CMakeLists.txt")
-  enable_testing() # so `ctest --test-dir build` finds the driver tests
-  add_subdirectory(driver)
+# extras/driver/ is a self-contained CMake project; it can also be configured
+# alone with `cmake -S extras/driver -B build`.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extras/driver/CMakeLists.txt")
+  if(PROJECT_IS_TOP_LEVEL)
+    enable_testing() # so `ctest --test-dir build` finds the driver tests
+  else()
+    # Fetched into someone else's build: bring only the library, so the
+    # consumer pays for neither Catch2 nor the CLI. Explicit choices win -
+    # -DARDUINODRIVER_BUILD_TESTS=ON still works (CMP0077 is NEW here).
+    if(NOT DEFINED ARDUINODRIVER_BUILD_TESTS)
+      set(ARDUINODRIVER_BUILD_TESTS OFF)
+    endif()
+    if(NOT DEFINED ARDUINODRIVER_BUILD_CLI)
+      set(ARDUINODRIVER_BUILD_CLI OFF)
+    endif()
+  endif()
+  add_subdirectory(extras/driver)
 endif()
 
 # ---- Firmware targets (optional, need arduino-cli on PATH) ----------------
@@ -18,8 +38,8 @@ find_program(ARDUINO_CLI arduino-cli)
 set(USBIO_UPLOAD_PORT "" CACHE STRING "Serial port used by the upload-<board> targets")
 
 if(ARDUINO_CLI)
-  set(_usbio_sketch "${CMAKE_CURRENT_SOURCE_DIR}/arduino/UsbIo/examples/UsbIoDevice")
-  set(_usbio_library "${CMAKE_CURRENT_SOURCE_DIR}/arduino/UsbIo")
+  set(_usbio_sketch "${CMAKE_CURRENT_SOURCE_DIR}/examples/UsbIoDevice")
+  set(_usbio_library "${CMAKE_CURRENT_SOURCE_DIR}") # the repo root IS the library
   set(_usbio_all_targets "")
 
   function(usbio_firmware_target name fqbn)

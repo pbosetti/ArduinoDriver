@@ -8,13 +8,13 @@ on:
   push:
     branches: [main]
     paths:
-      - "driver/**"
-      - "arduino/UsbIo/src/usbio_protocol.h"
+      - "extras/driver/**"
+      - "src/usbio_protocol.h"
       - ".github/workflows/driver-ci.yml"
   pull_request:
     paths:
-      - "driver/**"
-      - "arduino/UsbIo/src/usbio_protocol.h"
+      - "extras/driver/**"
+      - "src/usbio_protocol.h"
       - ".github/workflows/driver-ci.yml"
 
 jobs:
@@ -58,14 +58,14 @@ jobs:
         uses: actions/cache@v6
         with:
           path: build/_deps
-          key: driver-deps-${{ runner.os }}-${{ hashFiles('driver/CMakeLists.txt') }}
+          key: driver-deps-${{ runner.os }}-${{ hashFiles('extras/driver/CMakeLists.txt') }}
 
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
         run: |
-          cmake -S driver -B build -G Ninja \
+          cmake -S extras/driver -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DARDUINODRIVER_BUILD_TESTS=ON \
             -DARDUINODRIVER_BUILD_CLI=ON

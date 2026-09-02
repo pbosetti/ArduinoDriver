@@ -1,7 +1,7 @@
 # ArduinoDriver - libusb host driver for the UsbIo Arduino firmware.
 #
 # Works both as a subdirectory of the workspace root and standalone:
-#   cmake -S driver -B build -G Ninja && cmake --build build && ctest --test-dir build
+#   cmake -S extras/driver -B build -G Ninja && cmake --build build && ctest --test-dir build
 cmake_minimum_required(VERSION 3.24)
 
 project(ArduinoDriver
@@ -18,8 +18,9 @@ option(ARDUINODRIVER_WARNINGS_AS_ERRORS "Treat warnings in the ArduinoDriver tar
 option(ARDUINODRIVER_HARDWARE_TESTS "Enable the CTest entry that talks to a real board" OFF)
 
 # Directory holding usbio_protocol.h, the wire protocol shared with the
-# firmware (single source of truth; included verbatim by the driver).
-set(ARDUINODRIVER_PROTOCOL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../arduino/UsbIo/src"
+# firmware (single source of truth; included verbatim by the driver). The
+# driver sits at extras/driver/, so the library's src/ is two levels up.
+set(ARDUINODRIVER_PROTOCOL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../src"
   CACHE PATH "Directory containing usbio_protocol.h")
 cmake_path(ABSOLUTE_PATH ARDUINODRIVER_PROTOCOL_DIR NORMALIZE)
 if(NOT EXISTS "${ARDUINODRIVER_PROTOCOL_DIR}/usbio_protocol.h")

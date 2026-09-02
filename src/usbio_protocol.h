@@ -1,6 +1,6 @@
 /*
- * usbio_protocol.h - wire protocol shared by the firmware (arduino/UsbIo) and
- * the host driver (driver/). This file is the single source of truth for the
+ * usbio_protocol.h - wire protocol shared by the firmware (src/) and
+ * the host driver (extras/driver/). This file is the single source of truth for the
  * protocol: it is C-compatible, freestanding (only <stdint.h>) and compiles as
  * C17 and C++20 on every target (Arduino cores, clang, gcc, MSVC).
  *

@@ -230,7 +230,7 @@ int cmd_list(const std::shared_ptr<Context> &context, const Settings &s) {
                    d.pid, d.probe_error);
       }
     }
-    fmt::print("Linux: install driver/etc/99-arduino-usbio.rules (udev). "
+    fmt::print("Linux: install extras/driver/etc/99-arduino-usbio.rules (udev). "
                "Windows: bind WinUSB to the UsbIo interface with Zadig. "
                "Otherwise close the program holding the device.\n");
   }

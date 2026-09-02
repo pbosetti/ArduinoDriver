@@ -14,11 +14,17 @@ control transfers, the same way it would talk to a purpose-built USB device.
 └──────────────┘   GET_INFO / PIN_MODE / DIO_* / AI_* ...   └──────────────────┘
 ```
 
-| directory | content |
+The repository *is* the Arduino library: `library.properties`, `src/` and
+`examples/` sit at the root, so it installs and publishes like any other
+library. Everything the Arduino IDE ignores lives under `extras/`.
+
+| path | content |
 |---|---|
-| `arduino/UsbIo/` | Arduino library + `UsbIoDevice` example sketch (firmware side) |
-| `driver/` | `arduino_driver` C++20 library, `arduino-io` CLI, Catch2 tests |
-| `arduino/UsbIo/src/usbio_protocol.h` | the wire protocol, shared verbatim by both sides |
+| `src/` | the `UsbIo` Arduino library (firmware side), one folder per transport |
+| `examples/UsbIoDevice/` | the example sketch: `UsbIo.begin()` / `UsbIo.poll()` |
+| `src/usbio_protocol.h` | the wire protocol, shared verbatim by both sides |
+| `extras/driver/` | `arduino_driver` C++20 host library, `arduino-io` CLI, Catch2 tests |
+| `CMakeLists.txt` | root build: the host driver, plus `firmware-*` targets when `arduino-cli` is on PATH |
 | `PLAN.md` | design record: findings in the Arduino cores, decisions, verification plan |
 
 ## How it works
@@ -60,12 +66,12 @@ available for debugging.
 
 ### 1. Firmware
 
-The library lives in `arduino/UsbIo`. Either symlink/copy it into your
-sketchbook `libraries/` folder and open *File ▸ Examples ▸ UsbIo ▸ UsbIoDevice*
-in the IDE, or use `arduino-cli` from this directory:
+Install *UsbIo* from the Library Manager, or symlink/clone this repository into
+your sketchbook `libraries/` folder, then open
+*File ▸ Examples ▸ UsbIo ▸ UsbIoDevice*. With `arduino-cli`, from a clone:
 
 ```bash
-arduino-cli compile --fqbn arduino:mbed_portenta:envie_m7 --library arduino/UsbIo arduino/UsbIo/examples/UsbIoDevice
+arduino-cli compile --fqbn arduino:mbed_portenta:envie_m7 --library . examples/UsbIoDevice
 ```
 
 The whole sketch is:
@@ -83,17 +89,35 @@ The root `CMakeLists.txt` wraps the same commands as targets
 
 ### 2. Host driver
 
+The host driver lives in `extras/driver`, where the Arduino toolchain ignores
+it. Build it from the repository root:
+
 ```bash
 cmake -Bbuild -G Ninja
 cmake --build build
 ctest --test-dir build --output-on-failure   # unit tests, no hardware needed
-build/driver/arduino-io list
+build/extras/driver/arduino-io list
 ```
+
+`cmake -S extras/driver -B build` configures the driver alone, without the
+`firmware-*` targets.
 
 Dependencies (libusb via the official `libusb-cmake` wrapper, `fmt`, `cxxopts`,
 Catch2) are fetched with `FetchContent` and pinned. `-DARDUINODRIVER_SYSTEM_LIBUSB=ON`
 uses the system libusb-1.0 through pkg-config instead. Windows builds with
 MSVC (Visual Studio 2022+) using the same CMake project.
+
+To use the driver from another CMake project, point `FetchContent` at the
+repository root — the tests and the CLI are then off by default, so a consumer
+builds only the library and its two dependencies:
+
+```cmake
+FetchContent_Declare(ArduinoDriver
+  GIT_REPOSITORY https://github.com/MADS-NET/ArduinoDriver.git
+  GIT_TAG v0.1.0)
+FetchContent_MakeAvailable(ArduinoDriver)
+target_link_libraries(my_app PRIVATE ArduinoDriver::arduino_driver)
+```
 
 ### 3. Talk to the board
 
@@ -136,7 +160,7 @@ before any USB traffic, so most mistakes fail fast with a precise message.
 
 ## Protocol
 
-Full specification: [`usbio_protocol.h`](arduino/UsbIo/src/usbio_protocol.h).
+Full specification: [`usbio_protocol.h`](src/usbio_protocol.h).
 Requests are vendor control transfers with device recipient; OUT requests
 carry the pin in `wIndex` and the argument in `wValue` and have no data stage.
 
@@ -267,7 +291,7 @@ Nano RP2040 Connect D24–D29) they are addressable, exactly as a sketch could
   that and still sends EP0 requests straight to the device (dfu-util programs
   the UNO R4 through the same path). Claiming the UsbIo interface is optional
   here; the driver does it by default for exclusivity between processes.
-- **Linux** — copy `driver/etc/99-arduino-usbio.rules` to
+- **Linux** — copy `extras/driver/etc/99-arduino-usbio.rules` to
   `/etc/udev/rules.d/`, then `sudo udevadm control --reload && sudo udevadm trigger`,
   or run as root. The rule grants access for the Arduino, Raspberry Pi and
   Espressif vendor IDs.
@@ -285,7 +309,7 @@ Nano RP2040 Connect D24–D29) they are addressable, exactly as a sketch could
    reset for the bootloader, or `upload-portenta` with `-DUSBIO_UPLOAD_PORT`).
 2. `system_profiler SPUSBDataType` (macOS) or `lsusb -v` should list the board
    with an extra vendor-specific interface (class 255) besides CDC.
-3. `build/driver/arduino-io list` shows the board; `info` reports
+3. `build/extras/driver/arduino-io list` shows the board; `info` reports
    *Portenta H7*, 26 pins, 7 analog, 16/12/12 bits.
 4. `arduino-io mode 23 output && arduino-io write 23 0` lights the red LED
    (active-low); `write 23 1` turns it off. Same for 24 (green) and 25 (blue).
