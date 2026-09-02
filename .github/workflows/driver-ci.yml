@@ -1,0 +1,74 @@
+name: Driver CI
+
+# Compile-check the host driver (driver/) on Linux, macOS and Windows.
+# Firmware (arduino/) is intentionally out of scope: it needs arduino-cli
+# and board cores, which this workflow does not set up.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "driver/**"
+      - "arduino/UsbIo/src/usbio_protocol.h"
+      - ".github/workflows/driver-ci.yml"
+  pull_request:
+    paths:
+      - "driver/**"
+      - "arduino/UsbIo/src/usbio_protocol.h"
+      - ".github/workflows/driver-ci.yml"
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            cc: clang
+            cxx: clang++
+          - os: windows-latest
+            cc: cl
+            cxx: cl
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - name: Install libudev headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v6
+        with:
+          path: build/_deps
+          key: driver-deps-${{ runner.os }}-${{ hashFiles('driver/CMakeLists.txt') }}
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -S driver -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DARDUINODRIVER_BUILD_TESTS=ON \
+            -DARDUINODRIVER_BUILD_CLI=ON
+
+      - name: Build
+        run: cmake --build build
