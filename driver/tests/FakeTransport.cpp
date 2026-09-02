@@ -2,7 +2,9 @@
 #include "FakeTransport.h"
 
 #include <algorithm>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace ArduinoDriver::Testing {
@@ -23,6 +25,12 @@ void add_cap(FakeBoard &board, std::uint8_t pin, std::uint8_t mask) {
 bool is_digital_mode(std::optional<PinMode> mode) noexcept {
   return mode == PinMode::Input || mode == PinMode::Output ||
          mode == PinMode::InputPullup || mode == PinMode::InputPulldown;
+}
+
+/// STREAM_SELECT accepts ANALOG_IN or an *input* digital mode -- not OUTPUT.
+bool is_input_mode(std::optional<PinMode> mode) noexcept {
+  return mode == PinMode::Input || mode == PinMode::InputPullup ||
+         mode == PinMode::InputPulldown;
 }
 
 std::uint16_t clamp_u16(std::size_t n) noexcept {
@@ -116,8 +124,13 @@ std::size_t FakeTransport::control_in(std::uint8_t request, std::uint16_t value,
                                       std::uint16_t index,
                                       std::span<std::byte> data,
                                       std::chrono::milliseconds) {
-  _log.push_back(
-      {USBIO_REQTYPE_IN, request, value, index, clamp_u16(data.size())});
+  {
+    // A Stream's worker thread polls GET_STREAM_STATUS on this same path
+    // while the test thread may be reading the log (log(), count(), ...).
+    std::lock_guard<std::mutex> lock(_mutex);
+    _log.push_back(
+        {USBIO_REQTYPE_IN, request, value, index, clamp_u16(data.size())});
+  }
 
   std::array<std::byte, MaxReplyLen> reply{};
   std::size_t len = 0;
@@ -213,6 +226,28 @@ std::size_t FakeTransport::control_in(std::uint8_t request, std::uint16_t value,
     len = StatusReplyLen;
     break;
 
+  case Request::StreamStatus:
+    if ((_board.flags & USBIO_FLAG_STREAMING) == 0) {
+      stall(Status::Unsupported);
+    }
+    write_u8(reply, StreamStatusOffset::Status, static_cast<std::uint8_t>(Status::Ok));
+    write_u8(reply, StreamStatusOffset::Running, _stream_running ? 1 : 0);
+    write_u8(reply, StreamStatusOffset::NChannels,
+            static_cast<std::uint8_t>(_stream_selected.size()));
+    write_u8(reply, StreamStatusOffset::Flags, _stream_flags);
+    write_u16le(reply, StreamStatusOffset::PeriodUs, _stream_period_us);
+    write_u16le(reply, StreamStatusOffset::Reserved, 0);
+    {
+      // seq/overruns are also touched by queue_stream_records() /
+      // set_stream_overruns() from the test thread while a Stream's worker
+      // thread is running.
+      std::lock_guard<std::mutex> lock(_mutex);
+      write_u32le(reply, StreamStatusOffset::Seq, _stream_seq);
+      write_u32le(reply, StreamStatusOffset::Overruns, _stream_overruns);
+    }
+    len = StreamStatusLen;
+    break;
+
   default:
     // Unknown bRequest, or an OUT request issued in the IN direction.
     stall(Status::BadCmd);
@@ -230,7 +265,12 @@ std::size_t FakeTransport::control_in(std::uint8_t request, std::uint16_t value,
 void FakeTransport::control_out(std::uint8_t request, std::uint16_t value,
                                 std::uint16_t index,
                                 std::chrono::milliseconds) {
-  _log.push_back({USBIO_REQTYPE_OUT, request, value, index, 0});
+  {
+    // See control_in(): a Stream's worker thread reaches this path too
+    // (STREAM_STOP, from stop() / the destructor).
+    std::lock_guard<std::mutex> lock(_mutex);
+    _log.push_back({USBIO_REQTYPE_OUT, request, value, index, 0});
+  }
 
   if (_forced_stall) {
     const Status reason = *_forced_stall;
@@ -244,7 +284,8 @@ void FakeTransport::control_out(std::uint8_t request, std::uint16_t value,
   switch (req) {
   case Request::Reset:
     // Always accepted: queue cleared, DIO-capable pins back to INPUT,
-    // analog-only pads back to unconfigured, analog shadow cleared.
+    // analog-only pads back to unconfigured, analog shadow cleared. Also
+    // stops a running stream and clears its selection.
     for (std::size_t pin = 0; pin < n_pins; ++pin) {
       if (PinCaps{_board.caps[pin]}.dio()) {
         _mode[pin] = PinMode::Input;
@@ -255,6 +296,26 @@ void FakeTransport::control_out(std::uint8_t request, std::uint16_t value,
     }
     _queue_pending = 0;
     _queue_full = false;
+    _stream_running = false;
+    _stream_selected.clear();
+    return;
+  case Request::StreamSelect:
+    if ((_board.flags & USBIO_FLAG_STREAMING) == 0) {
+      stall(Status::Unsupported);
+    }
+    handle_stream_select(value, index);
+    return;
+  case Request::StreamStart:
+    if ((_board.flags & USBIO_FLAG_STREAMING) == 0) {
+      stall(Status::Unsupported);
+    }
+    handle_stream_start(value, index);
+    return;
+  case Request::StreamStop:
+    if ((_board.flags & USBIO_FLAG_STREAMING) == 0) {
+      stall(Status::Unsupported);
+    }
+    _stream_running = false; // always accepted; keeps the selection
     return;
   case Request::PinMode:
   case Request::DioWrite:
@@ -366,19 +427,31 @@ void FakeTransport::set_analog(std::uint8_t pin, std::uint16_t raw) {
   _ain[pin] = raw;
 }
 
-const LoggedRequest &FakeTransport::last() const {
+std::vector<LoggedRequest> FakeTransport::log() const {
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _log;
+}
+
+LoggedRequest FakeTransport::last() const {
+  std::lock_guard<std::mutex> lock(_mutex);
   if (_log.empty()) {
     throw std::logic_error("FakeTransport: the request log is empty");
   }
   return _log.back();
 }
 
-std::size_t FakeTransport::count(Request request) const noexcept {
+std::size_t FakeTransport::count(Request request) const {
   const auto code = static_cast<std::uint8_t>(request);
+  std::lock_guard<std::mutex> lock(_mutex);
   return static_cast<std::size_t>(
       std::count_if(_log.begin(), _log.end(), [code](const LoggedRequest &r) {
         return r.request == code;
       }));
+}
+
+void FakeTransport::clear_log() {
+  std::lock_guard<std::mutex> lock(_mutex);
+  _log.clear();
 }
 
 // ---- Internals --------------------------------------------------------------
@@ -418,10 +491,173 @@ std::size_t FakeTransport::encode_info(std::span<std::byte> out) {
   write_u16le(out, InfoOffset::VrefMv, _board.vref_mv);
   write_u16le(out, InfoOffset::IoMv, _board.io_mv);
   write_u16le(out, InfoOffset::Flags, _board.flags);
-  for (std::size_t i = 0; i < 4; ++i) {
+  write_u8(out, InfoOffset::StreamMaxChannels, _board.stream_max_channels);
+  for (std::size_t i = 0; i < 3; ++i) {
     write_u8(out, InfoOffset::Reserved + i, 0);
   }
   return InfoLen;
+}
+
+// ---- Streaming ----------------------------------------------------------
+
+void FakeTransport::handle_stream_select(std::uint16_t value,
+                                         std::uint16_t index) {
+  // Order per usbio_protocol.h: stream stopped, pin range, mode, value,
+  // channel-count limit.
+  if (_stream_running) {
+    stall(Status::Busy);
+  }
+  if (index >= _board.n_pins()) {
+    stall(Status::BadPin);
+  }
+  if (!(is_input_mode(_mode[index]) || _mode[index] == PinMode::AnalogIn)) {
+    stall(Status::BadMode);
+  }
+  if (value > 1) {
+    stall(Status::BadValue);
+  }
+  const auto pin = static_cast<std::uint8_t>(index);
+  const auto it =
+      std::find(_stream_selected.begin(), _stream_selected.end(), pin);
+  const bool already_selected = it != _stream_selected.end();
+  if (value != 0) { // add
+    if (!already_selected) {
+      if (_stream_selected.size() >= _board.stream_max_channels) {
+        stall(Status::BadValue);
+      }
+      _stream_selected.push_back(pin);
+    } // else: no-op, already selected
+  } else if (already_selected) { // remove
+    _stream_selected.erase(it);
+  } // else: no-op, was not selected
+}
+
+void FakeTransport::handle_stream_start(std::uint16_t value,
+                                        std::uint16_t index) {
+  // wValue = period_us, wIndex = flags (usbio_stream_flags).
+  if (_stream_running) {
+    stall(Status::Busy);
+  }
+  if (_stream_selected.empty()) {
+    stall(Status::BadValue);
+  }
+  if (value != 0 && value < StreamMinPeriodUs) {
+    stall(Status::BadValue);
+  }
+  constexpr auto known_flags = static_cast<std::uint16_t>(
+      USBIO_STREAM_FLAG_DIGITAL | USBIO_STREAM_FLAG_STOP_ON_OVERRUN);
+  if ((index & ~known_flags) != 0) {
+    stall(Status::BadValue);
+  }
+  _stream_flags = static_cast<std::uint8_t>(index);
+  _stream_period_us = value;
+  _stream_seq = 0;
+  _stream_overruns = 0;
+  _stream_running = true;
+}
+
+std::size_t FakeTransport::bulk_in(std::span<std::byte> data,
+                                   std::chrono::milliseconds timeout) {
+  if ((_board.flags & USBIO_FLAG_STREAMING) == 0) {
+    throw NotSupported(
+        "FakeTransport: board has no bulk IN endpoint (no USBIO_FLAG_STREAMING)");
+  }
+  std::unique_lock<std::mutex> lock(_mutex);
+  if (_bulk_queue.empty() && _bulk_chunks.empty()) {
+    // Idle: behave like a real endpoint with nothing to deliver. A Stream's
+    // worker calls this in a tight loop, so wait a little (not the full
+    // timeout -- that would make every test that starts and promptly stops
+    // a stream pay for it) to avoid spinning the CPU while polling.
+    lock.unlock();
+    std::this_thread::sleep_for(std::min(timeout, std::chrono::milliseconds{5}));
+    return 0;
+  }
+  std::size_t n = std::min(_bulk_queue.size(), data.size());
+  if (!_bulk_chunks.empty()) {
+    n = std::min(n, _bulk_chunks.front());
+    _bulk_chunks.pop_front();
+  }
+  std::copy_n(_bulk_queue.begin(), n, data.begin());
+  _bulk_queue.erase(_bulk_queue.begin(),
+                    _bulk_queue.begin() + static_cast<std::ptrdiff_t>(n));
+  return n;
+}
+
+void FakeTransport::set_stream_ramp(std::uint16_t start, std::uint16_t step,
+                                    std::uint32_t t0_us,
+                                    std::uint32_t dt_us) noexcept {
+  _ramp_start = start;
+  _ramp_step = step;
+  _ramp_t0_us = t0_us;
+  _ramp_dt_us = dt_us;
+  _ramp_record_index = 0;
+}
+
+void FakeTransport::queue_stream_records(
+    std::size_t count, std::uint32_t seq_step,
+    std::initializer_list<std::size_t> chunk_plan) {
+  const bool digital = (_stream_flags & USBIO_STREAM_FLAG_DIGITAL) != 0;
+  const auto n_samples = static_cast<std::uint16_t>(_stream_selected.size());
+  const std::size_t record_len =
+      stream_record_len(n_samples, digital, _board.n_pins());
+  std::vector<std::byte> record(record_len);
+  std::lock_guard<std::mutex> lock(_mutex);
+  for (std::size_t r = 0; r < count; ++r) {
+    const StreamHeader header{
+        StreamMagic, n_samples, _stream_seq,
+        _ramp_t0_us + _ramp_dt_us * _ramp_record_index};
+    encode_stream_header(record, header);
+    for (std::uint16_t i = 0; i < n_samples; ++i) {
+      const auto raw = static_cast<std::uint16_t>(
+          _ramp_start +
+          _ramp_step * (_ramp_record_index * n_samples + i));
+      write_u16le(record, StreamHeaderLen + 2 * static_cast<std::size_t>(i),
+                 raw);
+    }
+    if (digital) {
+      std::fill(record.begin() +
+                   static_cast<std::ptrdiff_t>(StreamHeaderLen + 2 * n_samples),
+               record.end(), std::byte{0});
+    }
+    _bulk_queue.insert(_bulk_queue.end(), record.begin(), record.end());
+    _stream_seq += seq_step;
+    ++_ramp_record_index;
+  }
+  for (const std::size_t n : chunk_plan) {
+    _bulk_chunks.push_back(n);
+  }
+}
+
+void FakeTransport::queue_bulk_garbage(std::size_t n) {
+  std::lock_guard<std::mutex> lock(_mutex);
+  for (std::size_t i = 0; i < n; ++i) {
+    _bulk_queue.push_back(static_cast<std::byte>(0xAAu));
+  }
+}
+
+void FakeTransport::queue_bulk_bytes(std::span<const std::byte> bytes) {
+  std::lock_guard<std::mutex> lock(_mutex);
+  _bulk_queue.insert(_bulk_queue.end(), bytes.begin(), bytes.end());
+}
+
+void FakeTransport::queue_bulk_chunk(std::size_t n) {
+  std::lock_guard<std::mutex> lock(_mutex);
+  _bulk_chunks.push_back(n);
+}
+
+std::uint32_t FakeTransport::stream_seq() const noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _stream_seq;
+}
+
+void FakeTransport::set_stream_overruns(std::uint32_t n) noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  _stream_overruns = n;
+}
+
+std::size_t FakeTransport::bulk_queue_size() const noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _bulk_queue.size();
 }
 
 } // namespace ArduinoDriver::Testing

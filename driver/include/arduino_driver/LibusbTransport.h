@@ -69,6 +69,28 @@ public:
   void control_out(std::uint8_t request, std::uint16_t value,
                    std::uint16_t index,
                    std::chrono::milliseconds timeout) override;
+  /// Reads decoded bytes off an internal ring of ~8 in-flight bulk transfers
+  /// (a few packets each), kept continuously resubmitted so the device
+  /// endpoint is never left waiting for the host to arm a read; this method
+  /// itself just drains what has arrived, pumping libusb's event loop
+  /// (libusb_handle_events_timeout) until data is available or `timeout`
+  /// elapses. The ring is created lazily on the first call and lives until
+  /// the transport is destroyed. Throws NotSupported when the device has no
+  /// bulk IN endpoint (has_bulk_in() is false), UsbError on a fatal transfer
+  /// error (e.g. the device was unplugged).
+  std::size_t bulk_in(std::span<std::byte> data,
+                      std::chrono::milliseconds timeout) override;
+
+  /// True when the vendor interface descriptor carries a bulk IN endpoint.
+  bool has_bulk_in() const noexcept { return _bulk_in_ep.has_value(); }
+  /// Endpoint address (with the IN bit set), when has_bulk_in().
+  std::optional<std::uint8_t> bulk_in_endpoint() const noexcept {
+    return _bulk_in_ep;
+  }
+  /// wMaxPacketSize of the bulk IN endpoint, 0 when has_bulk_in() is false.
+  std::uint16_t bulk_in_max_packet_size() const noexcept {
+    return _bulk_in_max_packet;
+  }
 
   /// True when the configuration descriptor carries the UsbIo interface.
   bool has_vendor_interface() const noexcept { return _interface.has_value(); }
@@ -91,11 +113,16 @@ private:
   std::uint16_t wire_index(std::uint16_t index) const;
   void close() noexcept;
 
+  class BulkRing; // async ring of bulk IN transfers backing bulk_in()
+
   std::shared_ptr<Context> _context;
   LibusbTransportOptions _options;
   libusb_device_handle *_handle{nullptr};
   std::optional<std::uint8_t> _interface;
   bool _claimed{false};
+  std::optional<std::uint8_t> _bulk_in_ep;
+  std::uint16_t _bulk_in_max_packet{0};
+  std::unique_ptr<BulkRing> _bulk_ring;
 };
 
 } // namespace ArduinoDriver

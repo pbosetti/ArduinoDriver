@@ -5,6 +5,7 @@
 // Exit codes: 0 success, 1 device or protocol error (message on stderr),
 // 2 usage error.
 #include "arduino_driver/Enumerator.h"
+#include "arduino_driver/Stream.h"
 
 #include <cxxopts.hpp>
 #include <fmt/format.h>
@@ -54,6 +55,12 @@ struct Settings {
   bool volts{false};
   double hz{10.0};
   bool verbose{false};
+
+  // `stream` only.
+  bool hz_given{false};                  ///< --hz was explicitly passed
+  std::optional<unsigned> period_us;     ///< --period-us
+  double stream_seconds{0.0};            ///< --seconds (0: run until Ctrl-C)
+  std::optional<std::string> csv_path;   ///< --csv
 };
 
 // ---- Argument parsing -------------------------------------------------------
@@ -418,6 +425,129 @@ int cmd_monitor(Device &dev, const std::vector<std::string> &args,
   return ExitOk;
 }
 
+/// Comma-separated pin list, e.g. "14,15,16".
+std::vector<std::uint8_t> parse_pin_list(std::string_view text) {
+  std::vector<std::uint8_t> pins;
+  std::size_t start = 0;
+  while (start <= text.size()) {
+    const std::size_t comma = text.find(',', start);
+    const std::string_view token =
+        text.substr(start, comma == std::string_view::npos
+                              ? std::string_view::npos
+                              : comma - start);
+    if (!token.empty()) {
+      pins.push_back(parse_pin(token));
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    start = comma + 1;
+  }
+  if (pins.empty()) {
+    throw UsageError(fmt::format("invalid pin list \"{}\"", text));
+  }
+  return pins;
+}
+
+/// StreamConfig::period from --hz / --period-us (mutually exclusive; neither
+/// given means free-running).
+std::chrono::microseconds resolve_stream_period(const Settings &s) {
+  if (s.hz_given && s.period_us) {
+    throw UsageError("stream: --hz and --period-us are mutually exclusive");
+  }
+  if (s.period_us) {
+    return std::chrono::microseconds(*s.period_us);
+  }
+  if (s.hz_given) {
+    if (!(s.hz > 0.0)) {
+      throw UsageError("--hz must be positive");
+    }
+    return std::chrono::microseconds(
+        static_cast<long long>(1'000'000.0 / s.hz + 0.5));
+  }
+  return std::chrono::microseconds{0}; // free running
+}
+
+/// A little RAII wrapper so an early exception (a bad --csv path, a
+/// rejected start_stream()) still closes the file.
+struct FileCloser {
+  void operator()(std::FILE *f) const noexcept {
+    if (f != nullptr) {
+      std::fclose(f);
+    }
+  }
+};
+using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
+
+/// Streams the selected pins to CSV (stdout, or --csv FILE) until --seconds
+/// elapses or Ctrl-C, then prints a summary (achieved rate, drop counts) to
+/// stderr so a plain `> file.csv` redirection stays clean CSV.
+int cmd_stream(Device &dev, const std::vector<std::string> &args,
+               const Settings &s) {
+  require_args(args, 1,
+               "stream <pins> [--hz N | --period-us N] [--seconds N] "
+               "[--volts] [--csv FILE]");
+  const std::vector<std::uint8_t> pins = parse_pin_list(args[0]);
+
+  StreamConfig config;
+  config.pins = pins;
+  config.period = resolve_stream_period(s);
+  Stream stream = dev.start_stream(config);
+
+  FilePtr csv_guard;
+  std::FILE *out = stdout;
+  if (s.csv_path) {
+    std::FILE *f = std::fopen(s.csv_path->c_str(), "w");
+    if (f == nullptr) {
+      throw UsageError(
+          fmt::format("cannot open \"{}\" for writing", *s.csv_path));
+    }
+    csv_guard.reset(f);
+    out = f;
+  }
+  fmt::print(out, "t_us,pin,{}\n", s.volts ? "volts" : "raw");
+
+  std::signal(SIGINT, on_interrupt);
+  const auto start = std::chrono::steady_clock::now();
+  std::vector<Sample> batch(pins.size() * 16);
+  std::uint64_t total_samples = 0;
+  while (!StopRequested.load()) {
+    if (s.stream_seconds > 0.0 &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                .count() >= s.stream_seconds) {
+      break;
+    }
+    const std::size_t n = stream.read(batch, 200ms);
+    for (std::size_t i = 0; i < n; ++i) {
+      const Sample &sample = batch[i];
+      if (s.volts) {
+        fmt::print(out, "{},{},{:.4f}\n", sample.t_us, sample.pin, sample.volts);
+      } else {
+        fmt::print(out, "{},{},{}\n", sample.t_us, sample.pin, sample.raw);
+      }
+    }
+    total_samples += n;
+  }
+  std::fflush(out);
+
+  const double elapsed = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+  const StreamStats stats = stream.stats();
+  const double rate = elapsed > 0.0 && !pins.empty()
+                         ? static_cast<double>(total_samples) / elapsed /
+                               static_cast<double>(pins.size())
+                         : 0.0;
+  fmt::print(stderr,
+            "stream: {} records ({} samples) in {:.3f} s ({:.1f} Hz achieved "
+            "per channel); device overruns {}, seq gaps {}, host drops {}, "
+            "resyncs {}\n",
+            stats.records_received, total_samples, elapsed, rate,
+            stats.device_overruns, stats.seq_gaps, stats.host_drops,
+            stats.resyncs);
+  return ExitOk;
+}
+
 constexpr std::string_view Commands = R"(Commands:
   list                      devices (bus:addr vid:pid board serial itf pins)
   info                      GET_INFO of the selected device
@@ -434,6 +564,12 @@ constexpr std::string_view Commands = R"(Commands:
   sync                      wait until the command queue is empty
   reset                     every DIO pin back to INPUT, queue cleared
   monitor [--hz N] [pins]   print levels/samples until Ctrl-C (set modes first)
+  stream <pins> [--hz N | --period-us N] [--seconds N] [--volts] [--csv FILE]
+                            continuous sampling over the bulk endpoint; pins
+                            are comma-separated and must already be in
+                            analog|input mode; CSV to stdout (or --csv FILE),
+                            summary (rate, drops) to stderr; runs until
+                            --seconds elapses or Ctrl-C
 )";
 
 Device open_selected(const std::shared_ptr<Context> &context,
@@ -463,8 +599,14 @@ int run(int argc, char **argv) {
       "use the interface-recipient request form (bmRequestType 0x41/0xC1)")(
       "no-claim", "do not claim the vendor interface")(
       "volts", "print analog values in volts")(
-      "hz", "monitor refresh rate",
+      "hz", "monitor refresh rate, or stream sample rate",
       cxxopts::value<double>()->default_value("10"))(
+      "period-us", "stream sampling period, microseconds (0 = free running)",
+      cxxopts::value<unsigned>())(
+      "seconds", "stream duration; omit to run until Ctrl-C",
+      cxxopts::value<double>())(
+      "csv", "stream: write CSV here instead of stdout",
+      cxxopts::value<std::string>())(
       "v,verbose", "libusb debug output on stderr")("h,help", "show this help")(
       "args", "command and arguments",
       cxxopts::value<std::vector<std::string>>());
@@ -500,6 +642,16 @@ int run(int argc, char **argv) {
   s.transport.claim_interface = parsed.count("no-claim") == 0;
   s.volts = parsed.count("volts") != 0;
   s.hz = parsed["hz"].as<double>();
+  s.hz_given = parsed.count("hz") != 0;
+  if (parsed.count("period-us") != 0) {
+    s.period_us = parsed["period-us"].as<unsigned>();
+  }
+  if (parsed.count("seconds") != 0) {
+    s.stream_seconds = parsed["seconds"].as<double>();
+  }
+  if (parsed.count("csv") != 0) {
+    s.csv_path = parsed["csv"].as<std::string>();
+  }
   s.verbose = parsed.count("verbose") != 0;
 
   std::vector<std::string> args;
@@ -518,7 +670,7 @@ int run(int argc, char **argv) {
     std::size_t min_args;
     std::string_view usage;
   };
-  constexpr std::array<Spec, 15> specs{{
+  constexpr std::array<Spec, 16> specs{{
       {"list", 0, "list"},
       {"info", 0, "info"},
       {"caps", 0, "caps"},
@@ -534,6 +686,9 @@ int run(int argc, char **argv) {
       {"sync", 0, "sync"},
       {"reset", 0, "reset"},
       {"monitor", 0, "monitor [--hz N] [pins...]"},
+      {"stream", 1,
+       "stream <pins> [--hz N | --period-us N] [--seconds N] [--volts] "
+       "[--csv FILE]"},
   }};
   const auto spec = std::find_if(
       specs.begin(), specs.end(),
@@ -599,6 +754,9 @@ int run(int argc, char **argv) {
   }
   if (command == "monitor") {
     return cmd_monitor(dev, args, s);
+  }
+  if (command == "stream") {
+    return cmd_stream(dev, args, s);
   }
   throw UsageError(
       fmt::format("unknown command \"{}\"\n\n{}", command, Commands));

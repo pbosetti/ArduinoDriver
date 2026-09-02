@@ -103,7 +103,8 @@ arduino-io caps                     # per-pin capability table
 arduino-io mode 13 output && arduino-io write 13 1
 arduino-io mode 14 analog  && arduino-io aread 14 --volts
 arduino-io mode 9 pwm      && arduino-io pwm 9 50%
-arduino-io monitor --hz 10 14 15    # stream reads until Ctrl-C
+arduino-io monitor --hz 10 14 15    # repeated control reads until Ctrl-C
+arduino-io stream 15,16 --hz 1000   # continuous sampling over the bulk endpoint
 arduino-io --help                   # full command list
 ```
 
@@ -152,6 +153,10 @@ carry the pin in `wIndex` and the argument in `wValue` and have no data stage.
 | `0x10 DIO_READ_ALL` | IN | – | – | status + bitmap, bit *i* = pin *i* |
 | `0x11 AI_READ_ALL` | IN | – | – | status + u16 per analog pin, ascending pin order |
 | `0x20 GET_STATUS` | IN | – | – | pending commands, reason of the last STALL |
+| `0x30 STREAM_SELECT` | OUT | pin | 0 remove / 1 add | – |
+| `0x31 STREAM_START` | OUT | flags | period µs (0 = free running) | – |
+| `0x32 STREAM_STOP` | OUT | – | – | – |
+| `0x33 STREAM_STATUS` | IN | – | – | running, channels, period, last seq, device overruns |
 | `0x7F RESET` | OUT | – | – | all pins to INPUT, queue cleared |
 
 Status codes: `OK, BUSY, BAD_PIN, BAD_MODE, BAD_CMD, UNSUPPORTED, QUEUE_FULL,
@@ -165,6 +170,66 @@ An optional interface-recipient form (`bmRequestType 0x41/0xC1`,
 interface; `arduino-io --interface-recipient` and
 `LibusbTransportOptions::recipient` select it, for hosts that must route
 through the interface.
+
+## Continuous sampling
+
+Control transfers cost one round trip per reading. For sustained sampling the
+boards whose core lets the vendor interface own endpoints add one **bulk IN
+endpoint** and push timestamped records to the host on their own. Control
+transfers stay the command channel; the bulk endpoint carries samples only.
+
+Available where `GET_INFO` reports the streaming flag — the mbed boards
+(Portenta H7, GIGA R1, Nano 33 BLE, Nano RP2040 Connect) and the SAMD21 boards
+(Zero, MKR, Nano 33 IoT). The Renesas boards cannot add an endpoint to their
+fixed descriptors, so `arduino-io info` shows no streaming flag there and the
+`STREAM_*` requests are refused; everything else works as before.
+
+```bash
+arduino-io mode 15 analog && arduino-io mode 16 analog
+arduino-io stream 15,16 --hz 1000 --seconds 3 --volts --csv samples.csv
+```
+
+```
+t_us,pin,volts
+1043216,15,0.4121
+1043216,16,1.0084
+1044216,15,0.4150
+…
+stream: 3029 records (6058 samples) in 3.028 s (1000.4 Hz achieved per channel);
+device overruns 0, seq gaps 0, host drops 0, resyncs 0
+```
+
+One row per sample (`t_us,pin,raw`, or `volts` with `--volts`); samples from
+one record share a timestamp.
+
+Pins must already be in `analog` or an input mode — `stream` selects channels,
+it does not configure them. The summary goes to stderr, so `--csv` is optional
+when redirecting stdout. From C++:
+
+```cpp
+Stream s = dev.start_stream({.pins = {15, 16}, .period = std::chrono::microseconds(1000)});
+std::array<Sample, 256> buf;
+while (running) {
+  const std::size_t n = s.read(buf, std::chrono::milliseconds(100));
+  for (std::size_t i = 0; i < n; ++i) use(buf[i].pin, buf[i].volts, buf[i].t_us);
+}
+// s.stats(): records_received, device_overruns, seq_gaps, host_drops, resyncs
+// the destructor stops the device stream and joins the worker
+```
+
+Each record carries the device's own `micros()` timestamp: sampling runs from
+`loop()`, not from a timer interrupt, so `t_us` — not host arrival time — is
+the timing reference, and the achieved rate is best-effort. Every record is
+numbered, so nothing is lost silently: a device-side drop (its ring filled)
+appears as a gap in `seq`, and `stats()` accounts for gaps, host-side drops and
+resyncs separately. While a stream runs the `Device` refuses other calls with
+`DeviceBusy`; `RESET`, a `pin_mode()` on a selected pin, and unplugging all
+stop it.
+
+Measured on a Portenta H7: 2 channels at 1 kHz for 3 s, 3029 records, zero
+overruns, gaps, drops or resyncs. The ceiling has not been measured yet — the
+firmware samples at most one record per `poll()` call, so the practical limit
+is the sketch's loop rate rather than the bus.
 
 ## Board support
 
@@ -232,13 +297,27 @@ Nano RP2040 Connect D24–D29) they are addressable, exactly as a sketch could
 7. `cmake -DARDUINODRIVER_HARDWARE_TESTS=ON build && ctest --test-dir build -R hardware --output-on-failure`
    runs the hidden hardware suite (set `ARDUINO_IO_LOOPBACK=out,in` with two
    wired pins for the loopback case).
+8. `arduino-io info` lists the streaming flag and
+   `arduino-io stream 15,16 --hz 1000 --seconds 3` then samples two analog
+   pins over the bulk endpoint (set their modes first). The summary line must
+   report the requested rate with zero gaps, drops and resyncs.
 
 ## Limitations and follow-ups
 
-- Control transfers only: one operation per ~1 ms USB frame. Fine for I/O
-  control; streaming (continuous sampling, waveform output) would need bulk
-  endpoints and a patched core on Renesas (`CFG_TUD_VENDOR 0`, fixed
-  descriptors).
+- Individual pin operations are control transfers: one per ~1 ms USB frame.
+  Continuous *input* now bypasses that through the bulk endpoint (see
+  [Continuous sampling](#continuous-sampling)); waveform *output* (DAC/PWM
+  playback) would need a second, bulk OUT endpoint and is not implemented.
+- Streaming needs an endpoint on the vendor interface, so it is unavailable on
+  the Renesas boards without a patched core (`CFG_TUD_VENDOR`, fixed
+  descriptors). Its rate ceiling is bounded by the sketch's loop rate, since
+  the firmware emits at most one record per `poll()`; on SAMD the core's
+  `USBDevice.send()` blocks until a 70 ms timeout when the host stops reading,
+  so the firmware stops a stream after three consecutive failed sends rather
+  than stalling `loop()` indefinitely.
+- The optional per-record digital bitmap (`STREAM_START` flags bit 0) is
+  carried and framed correctly but not yet surfaced through `Sample` or the
+  CLI.
 - `Device` is not thread-safe; use one instance per thread.
 - SAMD replies are limited to 64 bytes by the core's EP0 buffer (today's
   largest SAMD reply is 33 bytes).

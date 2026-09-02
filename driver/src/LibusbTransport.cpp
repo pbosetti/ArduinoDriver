@@ -7,9 +7,17 @@
 #include <fmt/format.h>
 #include <libusb.h>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <climits>
+#include <cstddef>
+#include <deque>
+#include <mutex>
+#include <new>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace ArduinoDriver {
 
@@ -73,6 +81,41 @@ std::vector<InterfaceTriple> read_interfaces(libusb_device *device) {
   return interfaces;
 }
 
+std::optional<BulkEndpoint> find_bulk_in_endpoint(libusb_device *device,
+                                                   std::uint8_t interface_number) {
+  libusb_config_descriptor *config = nullptr;
+  int rc = libusb_get_active_config_descriptor(device, &config);
+  if (rc < 0) {
+    rc = libusb_get_config_descriptor(device, 0, &config);
+  }
+  if (rc < 0 || config == nullptr) {
+    return std::nullopt;
+  }
+  std::optional<BulkEndpoint> found;
+  for (int i = 0; i < config->bNumInterfaces && !found; ++i) {
+    const libusb_interface &interface = config->interface[i];
+    for (int alt = 0; alt < interface.num_altsetting && !found; ++alt) {
+      const libusb_interface_descriptor &d = interface.altsetting[alt];
+      if (d.bInterfaceNumber != interface_number) {
+        continue;
+      }
+      for (int e = 0; e < d.bNumEndpoints; ++e) {
+        const libusb_endpoint_descriptor &ep = d.endpoint[e];
+        const bool is_in =
+            (ep.bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN;
+        const bool is_bulk =
+            (ep.bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) == LIBUSB_TRANSFER_TYPE_BULK;
+        if (is_in && is_bulk) {
+          found = BulkEndpoint{ep.bEndpointAddress, ep.wMaxPacketSize};
+          break;
+        }
+      }
+    }
+  }
+  libusb_free_config_descriptor(config);
+  return found;
+}
+
 } // namespace Detail
 
 namespace {
@@ -113,6 +156,30 @@ unsigned clamp_timeout(std::chrono::milliseconds timeout) noexcept {
   return static_cast<unsigned>(ms);
 }
 
+/// libusb_error matching a failed libusb_transfer::status, for reuse of
+/// Detail::throw_usb_error's message and exception mapping (StallError,
+/// TimeoutError, ...).
+int transfer_status_error(libusb_transfer_status status) noexcept {
+  switch (status) {
+  case LIBUSB_TRANSFER_COMPLETED:
+    return LIBUSB_SUCCESS;
+  case LIBUSB_TRANSFER_ERROR:
+    return LIBUSB_ERROR_IO;
+  case LIBUSB_TRANSFER_TIMED_OUT:
+    return LIBUSB_ERROR_TIMEOUT;
+  case LIBUSB_TRANSFER_CANCELLED:
+    return LIBUSB_ERROR_INTERRUPTED;
+  case LIBUSB_TRANSFER_STALL:
+    return LIBUSB_ERROR_PIPE;
+  case LIBUSB_TRANSFER_NO_DEVICE:
+    return LIBUSB_ERROR_NO_DEVICE;
+  case LIBUSB_TRANSFER_OVERFLOW:
+    return LIBUSB_ERROR_OVERFLOW;
+  default:
+    return LIBUSB_ERROR_OTHER;
+  }
+}
+
 } // namespace
 
 // ---- Context ----------------------------------------------------------------
@@ -141,6 +208,162 @@ void Context::set_log_level(int level) {
   }
 }
 
+// ---- BulkRing -----------------------------------------------------------
+//
+// Backs LibusbTransport::bulk_in() with a handful of always-in-flight bulk
+// transfers so the device's IN endpoint is never left waiting for the host
+// to arm a read between calls: the moment one transfer completes, its bytes
+// are queued and it is resubmitted immediately from the completion
+// callback -- before bulk_in() has even returned to its caller. bulk_in()
+// itself only drains the queue, pumping libusb_handle_events_timeout() to
+// let completions (and therefore resubmissions) happen.
+class LibusbTransport::BulkRing {
+public:
+  BulkRing(libusb_context *context, libusb_device_handle *handle,
+           std::uint8_t endpoint, std::uint16_t max_packet_size)
+      : _context(context) {
+    const std::size_t chunk =
+        static_cast<std::size_t>(std::max<std::uint16_t>(max_packet_size, 1)) *
+        PacketsPerTransfer;
+    for (Buf &buf : _bufs) {
+      buf.owner = this;
+      buf.data.resize(chunk);
+      buf.transfer = libusb_alloc_transfer(0);
+      if (buf.transfer == nullptr) {
+        throw std::bad_alloc();
+      }
+      libusb_fill_bulk_transfer(buf.transfer, handle, endpoint, buf.data.data(),
+                                static_cast<int>(buf.data.size()), on_complete,
+                                &buf, 0 /* no per-transfer timeout: it is
+                                        meant to sit armed indefinitely */);
+    }
+    for (Buf &buf : _bufs) {
+      submit(buf);
+    }
+  }
+
+  ~BulkRing() {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _stopping = true;
+    for (Buf &buf : _bufs) {
+      if (buf.submitted) {
+        libusb_cancel_transfer(buf.transfer);
+      }
+    }
+    lock.unlock();
+    // Every submitted transfer eventually completes (cancelled, or with a
+    // device error): wait for all of them before freeing their buffers.
+    while (_outstanding.load(std::memory_order_acquire) > 0) {
+      timeval tv{};
+      tv.tv_sec = 1;
+      tv.tv_usec = 0;
+      libusb_handle_events_timeout(_context, &tv);
+    }
+    for (Buf &buf : _bufs) {
+      libusb_free_transfer(buf.transfer);
+    }
+  }
+
+  BulkRing(const BulkRing &) = delete;
+  BulkRing &operator=(const BulkRing &) = delete;
+
+  /// Copies decoded bytes into `data`, pumping libusb events until some are
+  /// available or `timeout` elapses. Returns 0 on a plain timeout; throws
+  /// UsbError when a ring transfer failed fatally (e.g. the device was
+  /// unplugged).
+  std::size_t read(std::span<std::byte> data,
+                   std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_fatal_error) {
+          const int code = *_fatal_error;
+          _fatal_error.reset();
+          Detail::throw_usb_error(code, "bulk IN transfer failed");
+        }
+        if (!_queue.empty()) {
+          const std::size_t n = std::min(data.size(), _queue.size());
+          std::copy_n(_queue.begin(), n, data.begin());
+          _queue.erase(_queue.begin(),
+                      _queue.begin() + static_cast<std::ptrdiff_t>(n));
+          return n;
+        }
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        return 0;
+      }
+      const auto slice = std::min(
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now),
+          std::chrono::milliseconds{50});
+      timeval tv{};
+      tv.tv_sec = static_cast<decltype(tv.tv_sec)>(slice.count() / 1000);
+      tv.tv_usec = static_cast<decltype(tv.tv_usec)>((slice.count() % 1000) * 1000);
+      libusb_handle_events_timeout(_context, &tv);
+    }
+  }
+
+private:
+  static constexpr int RingSize = 8;
+  static constexpr int PacketsPerTransfer = 16;
+
+  struct Buf {
+    std::vector<unsigned char> data;
+    libusb_transfer *transfer{nullptr};
+    BulkRing *owner{nullptr};
+    bool submitted{false};
+  };
+
+  void submit(Buf &buf) {
+    const int rc = libusb_submit_transfer(buf.transfer);
+    if (rc < 0) {
+      buf.submitted = false;
+      if (!_fatal_error) {
+        _fatal_error = rc;
+      }
+      return;
+    }
+    buf.submitted = true;
+    _outstanding.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  static void LIBUSB_CALL on_complete(libusb_transfer *transfer) {
+    auto *buf = static_cast<Buf *>(transfer->user_data);
+    buf->owner->handle_complete(*buf);
+  }
+
+  void handle_complete(Buf &buf) {
+    // submit() also touches buf.submitted / _outstanding without its own
+    // locking (it is called unlocked from the constructor, before the ring
+    // is visible to any other thread), so it must run under _mutex here too.
+    std::lock_guard<std::mutex> lock(_mutex);
+    buf.submitted = false;
+    _outstanding.fetch_sub(1, std::memory_order_relaxed);
+    if (_stopping) {
+      return; // shutting down: leave the queue alone, do not resubmit
+    }
+    if (buf.transfer->status == LIBUSB_TRANSFER_COMPLETED) {
+      const auto *bytes =
+          reinterpret_cast<const std::byte *>(buf.transfer->buffer);
+      _queue.insert(_queue.end(), bytes, bytes + buf.transfer->actual_length);
+      submit(buf); // keep the endpoint continuously armed
+      return;
+    }
+    if (buf.transfer->status != LIBUSB_TRANSFER_CANCELLED && !_fatal_error) {
+      _fatal_error = transfer_status_error(buf.transfer->status);
+    }
+  }
+
+  libusb_context *_context;
+  std::array<Buf, RingSize> _bufs;
+  std::mutex _mutex;
+  std::deque<std::byte> _queue;
+  std::atomic<int> _outstanding{0};
+  bool _stopping{false};
+  std::optional<int> _fatal_error;
+};
+
 // ---- LibusbTransport --------------------------------------------------------
 
 LibusbTransport::LibusbTransport(std::shared_ptr<Context> context,
@@ -161,6 +384,12 @@ LibusbTransport::LibusbTransport(std::shared_ptr<Context> context,
         "{} has no UsbIo vendor interface: the interface-recipient request "
         "form is not available (Renesas boards cannot expose one)",
         describe_device(device)));
+  }
+  if (_interface) {
+    if (const auto bulk = Detail::find_bulk_in_endpoint(device, *_interface)) {
+      _bulk_in_ep = bulk->address;
+      _bulk_in_max_packet = bulk->max_packet_size;
+    }
   }
 
   int rc = libusb_open(device, &_handle);
@@ -193,6 +422,9 @@ LibusbTransport::LibusbTransport(std::shared_ptr<Context> context,
 LibusbTransport::~LibusbTransport() { close(); }
 
 void LibusbTransport::close() noexcept {
+  // Tear the ring down (cancels its transfers) before the handle they were
+  // submitted against goes away.
+  _bulk_ring.reset();
   if (_handle == nullptr) {
     return;
   }
@@ -202,6 +434,20 @@ void LibusbTransport::close() noexcept {
   }
   libusb_close(_handle);
   _handle = nullptr;
+}
+
+std::size_t LibusbTransport::bulk_in(std::span<std::byte> data,
+                                     std::chrono::milliseconds timeout) {
+  if (!_bulk_in_ep) {
+    throw NotSupported(
+        fmt::format("{} has no bulk IN endpoint: streaming is not available",
+                    describe_device(libusb_get_device(_handle))));
+  }
+  if (!_bulk_ring) {
+    _bulk_ring = std::make_unique<BulkRing>(_context->native(), _handle,
+                                            *_bulk_in_ep, _bulk_in_max_packet);
+  }
+  return _bulk_ring->read(data, timeout);
 }
 
 std::size_t LibusbTransport::control_in(std::uint8_t request,

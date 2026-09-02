@@ -32,6 +32,10 @@ enum class Request : std::uint8_t {
   DioReadAll = USBIO_REQ_DIO_READ_ALL,
   AiReadAll = USBIO_REQ_AI_READ_ALL,
   GetStatus = USBIO_REQ_GET_STATUS,
+  StreamSelect = USBIO_REQ_STREAM_SELECT,
+  StreamStart = USBIO_REQ_STREAM_START,
+  StreamStop = USBIO_REQ_STREAM_STOP,
+  StreamStatus = USBIO_REQ_STREAM_STATUS,
   Reset = USBIO_REQ_RESET,
 };
 
@@ -89,11 +93,19 @@ inline constexpr std::size_t DioReplyLen = sizeof(usbio_dio_reply_t);   // 2
 inline constexpr std::size_t AiReplyLen = sizeof(usbio_ai_reply_t);     // 4
 inline constexpr std::size_t AllHeaderLen = sizeof(usbio_all_header_t); // 2
 inline constexpr std::size_t StatusReplyLen = sizeof(usbio_status_reply_t); // 4
+inline constexpr std::size_t StreamStatusLen = sizeof(usbio_stream_status_t); // 16
+inline constexpr std::size_t StreamHeaderLen = sizeof(usbio_stream_header_t);  // 12
 
 inline constexpr std::size_t MaxPins = USBIO_MAX_PINS;
 inline constexpr std::size_t MaxAin = USBIO_MAX_AIN;
 inline constexpr std::size_t MaxReplyLen = USBIO_MAX_REPLY_LEN;
 inline constexpr std::size_t QueueDepth = USBIO_QUEUE_DEPTH;
+
+/// Streaming limits (see usbio_protocol.h "Streaming").
+inline constexpr std::uint16_t StreamMagic = USBIO_STREAM_MAGIC;
+inline constexpr std::size_t StreamEpSize = USBIO_STREAM_EP_SIZE;
+inline constexpr std::size_t MaxStreamChannels = USBIO_MAX_STREAM_CHANNELS;
+inline constexpr std::uint16_t StreamMinPeriodUs = USBIO_STREAM_MIN_PERIOD_US;
 
 /// Byte offsets inside the GET_INFO reply (usbio_info_t, packed by natural
 /// alignment: every uint16_t sits at an even offset).
@@ -110,8 +122,30 @@ inline constexpr std::size_t QueueDepth = 13;
 inline constexpr std::size_t VrefMv = 14;
 inline constexpr std::size_t IoMv = 16;
 inline constexpr std::size_t Flags = 18;
-inline constexpr std::size_t Reserved = 20;
+inline constexpr std::size_t StreamMaxChannels = 20;
+inline constexpr std::size_t Reserved = 21;
 } // namespace InfoOffset
+
+/// Byte offsets inside usbio_stream_status_t (GET_STREAM_STATUS reply).
+namespace StreamStatusOffset {
+inline constexpr std::size_t Status = 0;
+inline constexpr std::size_t Running = 1;
+inline constexpr std::size_t NChannels = 2;
+inline constexpr std::size_t Flags = 3;
+inline constexpr std::size_t PeriodUs = 4;
+inline constexpr std::size_t Reserved = 6;
+inline constexpr std::size_t Seq = 8;
+inline constexpr std::size_t Overruns = 12;
+} // namespace StreamStatusOffset
+
+/// Byte offsets inside usbio_stream_header_t (the record header on the bulk
+/// IN endpoint; the sample/bitmap payload follows at StreamHeaderLen).
+namespace StreamHeaderOffset {
+inline constexpr std::size_t Magic = 0;
+inline constexpr std::size_t NSamples = 2;
+inline constexpr std::size_t Seq = 4;
+inline constexpr std::size_t TUs = 8;
+} // namespace StreamHeaderOffset
 
 /// Length of the DIO_READ_ALL bitmap for a board with `n_pins` pins.
 constexpr std::size_t dio_bitmap_len(std::size_t n_pins) noexcept {
@@ -124,6 +158,22 @@ constexpr std::size_t dio_read_all_len(std::size_t n_pins) noexcept {
 /// Total AI_READ_ALL reply length (header + one uint16_t per analog pin).
 constexpr std::size_t ai_read_all_len(std::size_t n_ain) noexcept {
   return AllHeaderLen + 2 * n_ain;
+}
+/// Length of the digital bitmap appended to a stream record
+/// (USBIO_STREAM_FLAG_DIGITAL), padded with a zero byte to an even length.
+constexpr std::size_t stream_digital_bitmap_len(std::size_t n_pins) noexcept {
+  const std::size_t raw = dio_bitmap_len(n_pins);
+  return raw + (raw % 2);
+}
+/// Total length of one stream record: header + n_samples uint16_t samples
+/// [+ the padded digital bitmap]. Always even.
+constexpr std::size_t stream_record_len(std::size_t n_samples, bool digital,
+                                        std::size_t n_pins) noexcept {
+  std::size_t len = StreamHeaderLen + 2 * n_samples;
+  if (digital) {
+    len += stream_digital_bitmap_len(n_pins);
+  }
+  return len;
 }
 /// Largest value representable with `bits` bits (0 for bits == 0, capped at
 /// 16 bits, the width of wValue and of the ADC samples).
@@ -146,6 +196,9 @@ constexpr bool is_out(Request request) noexcept {
   case Request::DioWrite:
   case Request::PwmWrite:
   case Request::DacWrite:
+  case Request::StreamSelect:
+  case Request::StreamStart:
+  case Request::StreamStop:
   case Request::Reset:
     return true;
   case Request::GetInfo:
@@ -155,6 +208,7 @@ constexpr bool is_out(Request request) noexcept {
   case Request::DioReadAll:
   case Request::AiReadAll:
   case Request::GetStatus:
+  case Request::StreamStatus:
     return false;
   }
   return false;
@@ -213,6 +267,24 @@ struct PinCaps {
   constexpr bool operator==(const PinCaps &) const noexcept = default;
 };
 
+/// wIndex of STREAM_START / flags byte of usbio_stream_status_t.
+struct StreamFlags {
+  static constexpr std::uint8_t Digital = USBIO_STREAM_FLAG_DIGITAL;
+  static constexpr std::uint8_t StopOnOverrun = USBIO_STREAM_FLAG_STOP_ON_OVERRUN;
+
+  std::uint8_t bits{0};
+
+  constexpr bool has(std::uint8_t mask) const noexcept {
+    return (bits & mask) == mask;
+  }
+  /// The digital bitmap is appended to every record.
+  constexpr bool digital() const noexcept { return has(Digital); }
+  /// The stream stops instead of dropping records when the ring fills.
+  constexpr bool stop_on_overrun() const noexcept { return has(StopOnOverrun); }
+
+  constexpr bool operator==(const StreamFlags &) const noexcept = default;
+};
+
 /// Capability bits a pin must carry to accept `mode` (0xFF for an unknown
 /// mode, which no pin satisfies). INPUT_PULLDOWN additionally needs
 /// Info::supports_pulldown().
@@ -258,6 +330,8 @@ struct Info {
   std::uint16_t vref_mv{0};    ///< ADC full-scale voltage, millivolts
   std::uint16_t io_mv{0};      ///< digital logic level, millivolts
   std::uint16_t flags{0};      ///< USBIO_FLAG_* bits
+  std::uint8_t stream_max_channels{0}; ///< pins STREAM_SELECT accepts at
+                                       ///< once; 0 when streaming() is false
 
   constexpr bool has_vendor_interface() const noexcept {
     return (flags & USBIO_FLAG_VENDOR_INTERFACE) != 0;
@@ -266,6 +340,10 @@ struct Info {
     return (flags & USBIO_FLAG_PULLDOWN) != 0;
   }
   constexpr bool has_dac() const noexcept { return dac_bits != 0; }
+  /// True when the board exposes the bulk IN endpoint and STREAM_* requests.
+  constexpr bool streaming() const noexcept {
+    return (flags & USBIO_FLAG_STREAMING) != 0;
+  }
 };
 
 // ---- Little-endian byte access ----------------------------------------------
@@ -295,6 +373,19 @@ constexpr void write_u16le(std::span<std::byte> bytes, std::size_t offset,
   bytes[offset + 1] = static_cast<std::byte>((value >> 8) & 0xFFu);
 }
 
+constexpr std::uint32_t read_u32le(std::span<const std::byte> bytes,
+                                   std::size_t offset) noexcept {
+  return static_cast<std::uint32_t>(read_u16le(bytes, offset)) |
+        (static_cast<std::uint32_t>(read_u16le(bytes, offset + 2)) << 16);
+}
+
+constexpr void write_u32le(std::span<std::byte> bytes, std::size_t offset,
+                           std::uint32_t value) noexcept {
+  write_u16le(bytes, offset, static_cast<std::uint16_t>(value & 0xFFFFu));
+  write_u16le(bytes, offset + 2,
+             static_cast<std::uint16_t>((value >> 16) & 0xFFFFu));
+}
+
 /// Decodes a GET_INFO reply. Throws ProtocolError when the buffer is shorter
 /// than InfoLen or does not start with the "UIO1" magic. The protocol
 /// version is returned as-is; Device checks it against ProtocolVersion.
@@ -322,7 +413,74 @@ inline Info decode_info(std::span<const std::byte> bytes) {
   info.vref_mv = read_u16le(bytes, InfoOffset::VrefMv);
   info.io_mv = read_u16le(bytes, InfoOffset::IoMv);
   info.flags = read_u16le(bytes, InfoOffset::Flags);
+  info.stream_max_channels = read_u8(bytes, InfoOffset::StreamMaxChannels);
   return info;
+}
+
+// ---- Streaming ---------------------------------------------------------------
+
+/// Decoded usbio_stream_status_t (GET_STREAM_STATUS reply).
+struct StreamStatus {
+  Status status{Status::Ok};
+  bool running{false};
+  std::uint8_t n_channels{0};
+  StreamFlags flags{};
+  std::uint16_t period_us{0}; ///< 0 = free running
+  std::uint32_t seq{0};       ///< seq of the most recent record produced
+  std::uint32_t overruns{0};  ///< records dropped by the device since START
+};
+
+/// Decodes a GET_STREAM_STATUS reply. Throws ProtocolError when the buffer is
+/// shorter than StreamStatusLen.
+inline StreamStatus decode_stream_status(std::span<const std::byte> bytes) {
+  if (bytes.size() < StreamStatusLen) {
+    throw ProtocolError(
+        "GET_STREAM_STATUS reply is too short: " +
+        std::to_string(bytes.size()) + " of " +
+        std::to_string(StreamStatusLen) + " bytes");
+  }
+  StreamStatus s;
+  s.status = static_cast<Status>(read_u8(bytes, StreamStatusOffset::Status));
+  s.running = read_u8(bytes, StreamStatusOffset::Running) != 0;
+  s.n_channels = read_u8(bytes, StreamStatusOffset::NChannels);
+  s.flags.bits = read_u8(bytes, StreamStatusOffset::Flags);
+  s.period_us = read_u16le(bytes, StreamStatusOffset::PeriodUs);
+  s.seq = read_u32le(bytes, StreamStatusOffset::Seq);
+  s.overruns = read_u32le(bytes, StreamStatusOffset::Overruns);
+  return s;
+}
+
+/// Header of one record on the bulk IN endpoint (usbio_stream_header_t); the
+/// sample payload (and the optional digital bitmap) follows at
+/// StreamHeaderLen, see stream_record_len().
+struct StreamHeader {
+  std::uint16_t magic{0}; ///< StreamMagic when this is a real record header
+  std::uint16_t n_samples{0};
+  std::uint32_t seq{0};
+  std::uint32_t t_us{0};
+
+  constexpr bool has_magic() const noexcept { return magic == StreamMagic; }
+};
+
+/// Decodes the 12-byte header of one stream record. Caller guarantees
+/// `bytes.size() >= StreamHeaderLen`.
+constexpr StreamHeader decode_stream_header(std::span<const std::byte> bytes) noexcept {
+  StreamHeader h;
+  h.magic = read_u16le(bytes, StreamHeaderOffset::Magic);
+  h.n_samples = read_u16le(bytes, StreamHeaderOffset::NSamples);
+  h.seq = read_u32le(bytes, StreamHeaderOffset::Seq);
+  h.t_us = read_u32le(bytes, StreamHeaderOffset::TUs);
+  return h;
+}
+
+/// Encodes the 12-byte header of one stream record. Caller guarantees
+/// `bytes.size() >= StreamHeaderLen`.
+constexpr void encode_stream_header(std::span<std::byte> bytes,
+                                    const StreamHeader &header) noexcept {
+  write_u16le(bytes, StreamHeaderOffset::Magic, header.magic);
+  write_u16le(bytes, StreamHeaderOffset::NSamples, header.n_samples);
+  write_u32le(bytes, StreamHeaderOffset::Seq, header.seq);
+  write_u32le(bytes, StreamHeaderOffset::TUs, header.t_us);
 }
 
 // ---- Names ------------------------------------------------------------------
@@ -352,6 +510,14 @@ constexpr std::string_view to_string(Request request) noexcept {
     return "AI_READ_ALL";
   case Request::GetStatus:
     return "GET_STATUS";
+  case Request::StreamSelect:
+    return "STREAM_SELECT";
+  case Request::StreamStart:
+    return "STREAM_START";
+  case Request::StreamStop:
+    return "STREAM_STOP";
+  case Request::StreamStatus:
+    return "GET_STREAM_STATUS";
   case Request::Reset:
     return "RESET";
   }

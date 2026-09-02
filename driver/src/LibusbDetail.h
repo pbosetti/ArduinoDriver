@@ -6,6 +6,8 @@
 
 #include <libusb.h>
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,5 +25,18 @@ std::string describe_usb_error(int code);
 /// the first one when the device is not configured; empty when no
 /// configuration descriptor can be read. Does not open the device.
 std::vector<InterfaceTriple> read_interfaces(libusb_device *device);
+
+/// Address and max packet size of one endpoint of a config descriptor.
+struct BulkEndpoint {
+  std::uint8_t address;        ///< bEndpointAddress (direction bit set)
+  std::uint16_t max_packet_size;
+};
+
+/// The first bulk IN endpoint of altsetting 0 of `interface_number`, from the
+/// same config descriptor read_interfaces() uses. std::nullopt when the
+/// descriptor cannot be read or the interface has no bulk IN endpoint. Does
+/// not open the device.
+std::optional<BulkEndpoint> find_bulk_in_endpoint(libusb_device *device,
+                                                   std::uint8_t interface_number);
 
 } // namespace ArduinoDriver::Detail

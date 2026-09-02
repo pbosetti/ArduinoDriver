@@ -3,12 +3,15 @@
 
 #include "arduino_driver/Errors.h"
 #include "arduino_driver/Protocol.h"
+#include "arduino_driver/Stream.h"
 #include "arduino_driver/Transport.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -145,7 +148,23 @@ public:
   /// unconfigured, queue cleared.
   void reset();
 
+  // ---- Streaming (Phase 2) ---------------------------------------------------
+
+  /// Builds the channel selection (STREAM_SELECT for each pin, in order) and
+  /// starts the device sampling it (STREAM_START), returning an RAII Stream.
+  /// Throws NotSupported when info().streaming() is false; InvalidValue when
+  /// config.pins is empty, longer than info().stream_max_channels, or the
+  /// period is out of range; InvalidPin for an out-of-range pin; InvalidMode
+  /// when a pin is not already in ANALOG_IN or an INPUT* mode (the device
+  /// STALLs STREAM_SELECT with BAD_MODE); DeviceBusy when a Stream from this
+  /// Device is already running. A failed call leaves no pins selected.
+  /// See Stream.h for the threading contract this puts in effect for as long
+  /// as the returned Stream runs (or is not destroyed / stopped).
+  Stream start_stream(StreamConfig config);
+
 private:
+  friend class Stream;
+
   void load_info();
   void load_caps();
   /// pin_caps() plus a capability check (NotSupported).
@@ -160,12 +179,34 @@ private:
   /// IN request without interpretation (wValue = 0).
   std::size_t raw_in(Request request, std::uint16_t index,
                      std::span<std::byte> reply);
+  /// Throws DeviceBusy when a Stream is running; called at the top of every
+  /// method above that touches the transport (not by the Stream-only calls
+  /// below, and not by the pure accessors, which stay usable while streaming).
+  void check_not_streaming(std::string_view what) const;
+  /// GET_STREAM_STATUS, for Stream's worker to refresh its stats(). Callable
+  /// only while a stream is running; serialised against end_stream().
+  StreamStatus poll_stream_status();
+  /// STREAM_STOP (best effort: errors are swallowed) and clears the
+  /// streaming flag. Called by Stream::stop() / its destructor; never
+  /// throws, safe to call more than once.
+  void end_stream() noexcept;
 
   std::unique_ptr<Transport> _transport;
   Options _options;
   Info _info{};
   std::vector<PinCaps> _caps;
   std::vector<std::uint8_t> _analog_pins;
+
+  /// Streaming state lives behind a pointer so Device stays movable
+  /// (std::atomic and std::mutex are neither): moving a Device with a
+  /// running Stream is not supported (see Stream.h).
+  struct StreamState {
+    std::atomic<bool> streaming{false};
+    std::mutex mutex; ///< serialises poll_stream_status() / end_stream()
+                      ///< against each other and against start_stream()
+    std::vector<std::uint8_t> selected; ///< STREAM_SELECT bookkeeping
+  };
+  std::unique_ptr<StreamState> _stream{std::make_unique<StreamState>()};
 };
 
 } // namespace ArduinoDriver

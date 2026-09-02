@@ -16,6 +16,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <initializer_list>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -39,6 +42,10 @@ struct FakeBoard {
   /// Report this n_ain instead of the real count (exercises the driver's
   /// consistency check).
   std::optional<std::uint8_t> n_ain_override;
+  /// usbio_info_t.stream_max_channels; 0 unless a test opts in (set flags
+  /// with USBIO_FLAG_STREAMING too, e.g. `board.flags |=
+  /// USBIO_FLAG_STREAMING; board.stream_max_channels = 4;`).
+  std::uint8_t stream_max_channels{0};
 
   std::uint8_t n_pins() const noexcept;
   /// Pins carrying PinCaps::Ain, ascending.
@@ -82,6 +89,14 @@ public:
   void control_out(std::uint8_t request, std::uint16_t value,
                    std::uint16_t index,
                    std::chrono::milliseconds timeout) override;
+  /// Serves bytes off the bulk queue (see "Bulk streaming model" below), in
+  /// chunks controlled by queue_bulk_chunk() where one was queued, otherwise
+  /// as many as fit `data`. Returns 0 (not an error) when the queue is
+  /// empty, matching Transport::bulk_in()'s "0 on timeout" contract. Throws
+  /// NotSupported when the board has no USBIO_FLAG_STREAMING, mirroring
+  /// LibusbTransport on a board without a bulk IN endpoint.
+  std::size_t bulk_in(std::span<std::byte> data,
+                      std::chrono::milliseconds timeout) override;
 
   // ---- Firmware state -------------------------------------------------------
   const FakeBoard &board() const noexcept { return _board; }
@@ -127,12 +142,74 @@ public:
   /// GET_INFO reports this magic (first four characters, zero-padded).
   void set_magic(std::string_view magic) noexcept;
 
+  // ---- Streaming state (mirrors the device-side selection/scheduler) --------
+  bool stream_running() const noexcept { return _stream_running; }
+  const std::vector<std::uint8_t> &stream_selected() const noexcept {
+    return _stream_selected;
+  }
+  std::uint8_t stream_flags() const noexcept { return _stream_flags; }
+  std::uint16_t stream_period_us() const noexcept { return _stream_period_us; }
+  /// GET_STREAM_STATUS.seq as of the last queue_stream_records() call
+  /// (guarded: safe to call while a Stream's worker thread is running).
+  std::uint32_t stream_seq() const noexcept;
+  /// Device-side ring overruns GET_STREAM_STATUS should report next
+  /// (guarded: safe to call while a Stream's worker thread is running).
+  void set_stream_overruns(std::uint32_t n) noexcept;
+
+  // ---- Bulk streaming model ---------------------------------------------------
+  // The bulk queue is a flat byte buffer bulk_in() drains from; tests build it
+  // with the helpers below to exercise framing, straddling, resync and drop
+  // accounting without a real timer/thread. A Stream's worker thread calls
+  // bulk_in() (and, indirectly, the StreamStatus branch of control_in(), and
+  // control_out() for STREAM_STOP via the destructor / stop()) in the
+  // background as soon as Device::start_stream() returns, so these methods --
+  // and set_stream_overruns(), log(), last(), count(), clear_log() -- are
+  // safe to call from the test's thread while a stream is running: the bulk
+  // queue, the two counters GET_STREAM_STATUS reports (seq, overruns) and the
+  // wire log are all guarded by an internal mutex. Everything else in
+  // FakeTransport is still only meant to be touched from one thread at a
+  // time, as before.
+
+  /// The generator queue_stream_records() uses: sample i of record r is
+  /// `start + step * (r * n_samples + i)` (wrapping mod 2^16); `t_us` of
+  /// record r is `t0_us + dt_us * r`.
+  void set_stream_ramp(std::uint16_t start, std::uint16_t step,
+                       std::uint32_t t0_us, std::uint32_t dt_us) noexcept;
+  /// Appends `count` well-formed records built from the ramp and the current
+  /// stream_selected()/stream_flags() (so it matches whatever STREAM_START
+  /// actually configured) to the bulk queue. `seq_step` lets the first of
+  /// these records jump ahead by more than 1 from the running seq counter,
+  /// simulating `seq_step - 1` device-side drops (Stream::stats().seq_gaps).
+  /// `chunk_plan`, when given, is queued (see queue_bulk_chunk()) under the
+  /// same lock as the record bytes, so it takes effect atomically with
+  /// them -- the only way to force an exact split point (e.g. a record
+  /// straddling two bulk_in() calls) without a race against a Stream's
+  /// worker thread that may already be draining the queue.
+  void queue_stream_records(std::size_t count, std::uint32_t seq_step = 1,
+                            std::initializer_list<std::size_t> chunk_plan = {});
+  /// Appends `n` bytes that never form a valid USBIO_STREAM_MAGIC, to
+  /// exercise resync.
+  void queue_bulk_garbage(std::size_t n);
+  /// Appends raw bytes verbatim (for hand-built edge cases).
+  void queue_bulk_bytes(std::span<const std::byte> bytes);
+  /// Forces the next bulk_in() call to return exactly `n` bytes off the
+  /// front of the queue (0 for a zero-length packet, or less than one
+  /// record to force it to straddle two calls). One-shot: queue several to
+  /// script a whole sequence of calls; once exhausted, bulk_in() goes back
+  /// to draining as much of the queue as fits the caller's buffer.
+  void queue_bulk_chunk(std::size_t n);
+  /// Bytes still queued and not yet served by bulk_in() (guarded).
+  std::size_t bulk_queue_size() const noexcept;
+
   // ---- Wire log -------------------------------------------------------------
-  const std::vector<LoggedRequest> &log() const noexcept { return _log; }
+  // Returned by value (guarded): a Stream's worker thread appends to the log
+  // too (STREAM_STATUS polls, and STREAM_STOP from stop() / the destructor),
+  // so a reference into it would not be safe to use outside the lock.
+  std::vector<LoggedRequest> log() const;
   /// Most recent request; throws std::logic_error when the log is empty.
-  const LoggedRequest &last() const;
-  std::size_t count(Request request) const noexcept;
-  void clear_log() noexcept { _log.clear(); }
+  LoggedRequest last() const;
+  std::size_t count(Request request) const;
+  void clear_log();
 
 private:
   struct Truncation {
@@ -144,6 +221,8 @@ private:
   bool take_busy() noexcept;
   std::size_t encode_info(std::span<std::byte> out);
   void check_pin(std::uint8_t pin) const;
+  void handle_stream_select(std::uint16_t value, std::uint16_t index);
+  void handle_stream_start(std::uint16_t value, std::uint16_t index);
 
   FakeBoard _board;
   std::vector<std::optional<PinMode>> _mode;
@@ -161,6 +240,28 @@ private:
   std::optional<Truncation> _truncate;
   std::uint16_t _protocol_version{ProtocolVersion};
   std::array<char, USBIO_MAGIC_LEN> _magic{};
+
+  // Streaming (device-side selection/scheduler state).
+  bool _stream_running{false};
+  std::vector<std::uint8_t> _stream_selected;
+  std::uint8_t _stream_flags{0};
+  std::uint16_t _stream_period_us{0};
+  std::uint32_t _stream_seq{0};
+  std::uint32_t _stream_overruns{0};
+
+  // Bulk model. _mutex guards exactly the state a Stream's worker
+  // thread touches concurrently with the test thread: the byte queue and
+  // the two counters GET_STREAM_STATUS reports (seq, overruns). The ramp
+  // parameters are only ever touched from the test thread (queue_stream_
+  // records() is what turns them into queue bytes) and need no locking.
+  mutable std::mutex _mutex;
+  std::deque<std::byte> _bulk_queue;
+  std::deque<std::size_t> _bulk_chunks;
+  std::uint16_t _ramp_start{0};
+  std::uint16_t _ramp_step{0};
+  std::uint32_t _ramp_t0_us{0};
+  std::uint32_t _ramp_dt_us{0};
+  std::uint32_t _ramp_record_index{0};
 };
 
 } // namespace ArduinoDriver::Testing

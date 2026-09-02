@@ -119,15 +119,19 @@ if(ARDUINODRIVER_BUILD_TESTS)
 endif()
 
 # ---- Library ---------------------------------------------------------------
+find_package(Threads REQUIRED)
+
 add_library(arduino_driver STATIC
   include/arduino_driver/Errors.h
   include/arduino_driver/Protocol.h
   include/arduino_driver/Transport.h
   include/arduino_driver/Device.h
+  include/arduino_driver/Stream.h
   include/arduino_driver/LibusbTransport.h
   include/arduino_driver/Enumerator.h
   src/LibusbDetail.h
   src/Device.cpp
+  src/Stream.cpp
   src/LibusbTransport.cpp
   src/Enumerator.cpp
 )
@@ -138,7 +142,7 @@ target_include_directories(arduino_driver PUBLIC
   $<BUILD_INTERFACE:${ARDUINODRIVER_PROTOCOL_DIR}>)
 target_link_libraries(arduino_driver
   PUBLIC ArduinoDriver::libusb
-  PRIVATE fmt::fmt)
+  PRIVATE fmt::fmt Threads::Threads)
 
 # ---- CLI -------------------------------------------------------------------
 if(ARDUINODRIVER_BUILD_CLI)

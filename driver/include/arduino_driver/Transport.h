@@ -37,6 +37,14 @@ public:
                            std::uint16_t index,
                            std::chrono::milliseconds timeout) = 0;
 
+  /// Reads from the streaming bulk IN endpoint (Phase 2). Returns the number
+  /// of bytes received, 0 .. data.size(); a timeout with nothing to deliver
+  /// is reported as 0 bytes, not an exception (the stream may simply be
+  /// idle), so callers loop on it. Implementations without a bulk IN
+  /// endpoint throw NotSupported.
+  virtual std::size_t bulk_in(std::span<std::byte> data,
+                              std::chrono::milliseconds timeout) = 0;
+
 protected:
   Transport() = default;
 };

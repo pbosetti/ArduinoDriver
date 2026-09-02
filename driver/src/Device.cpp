@@ -27,8 +27,12 @@ std::string describe_request(Request request, std::uint16_t index) {
   case Request::DioReadAll:
   case Request::AiReadAll:
   case Request::GetStatus:
+  case Request::StreamStop:
+  case Request::StreamStatus:
   case Request::Reset:
     return std::string(to_string(request));
+  case Request::StreamStart:
+    return fmt::format("{} (flags 0x{:02X})", to_string(request), index);
   default:
     return fmt::format("{} (pin {})", to_string(request), index);
   }
@@ -175,6 +179,7 @@ PinCaps Device::require_caps(std::uint8_t pin, std::uint8_t cap_mask,
 // ---- Configuration ----------------------------------------------------------
 
 void Device::pin_mode(std::uint8_t pin, PinMode mode) {
+  check_not_streaming("pin_mode");
   const PinCaps caps = pin_caps(pin);
   const auto code = static_cast<std::uint8_t>(mode);
   if (code >= PinModeCount) {
@@ -195,11 +200,13 @@ void Device::pin_mode(std::uint8_t pin, PinMode mode) {
 // ---- Digital I/O ------------------------------------------------------------
 
 void Device::digital_write(std::uint8_t pin, bool high) {
+  check_not_streaming("digital_write");
   require_caps(pin, PinCaps::Dio, "digital I/O");
   send_out(Request::DioWrite, static_cast<std::uint16_t>(high ? 1 : 0), pin);
 }
 
 bool Device::digital_read(std::uint8_t pin) {
+  check_not_streaming("digital_read");
   require_caps(pin, PinCaps::Dio, "digital I/O");
   std::array<std::byte, DioReplyLen> reply{};
   read_in(Request::DioRead, pin, reply, DioReplyLen);
@@ -207,6 +214,7 @@ bool Device::digital_read(std::uint8_t pin) {
 }
 
 std::vector<bool> Device::read_all_digital() {
+  check_not_streaming("read_all_digital");
   std::array<std::byte, dio_read_all_len(MaxPins)> buffer{};
   const std::size_t len = dio_read_all_len(_info.n_pins);
   const std::span<std::byte> reply(buffer.data(), len);
@@ -222,6 +230,7 @@ std::vector<bool> Device::read_all_digital() {
 // ---- Analog input -----------------------------------------------------------
 
 std::uint16_t Device::analog_read(std::uint8_t pin) {
+  check_not_streaming("analog_read");
   require_caps(pin, PinCaps::Ain, "analog input");
   std::array<std::byte, AiReplyLen> reply{};
   read_in(Request::AiRead, pin, reply, AiReplyLen);
@@ -241,6 +250,7 @@ double Device::to_volts(std::uint16_t raw) const noexcept {
 }
 
 std::vector<std::uint16_t> Device::read_all_analog() {
+  check_not_streaming("read_all_analog");
   std::array<std::byte, ai_read_all_len(MaxAin)> buffer{};
   const std::size_t len = ai_read_all_len(_info.n_ain);
   const std::span<std::byte> reply(buffer.data(), len);
@@ -255,6 +265,7 @@ std::vector<std::uint16_t> Device::read_all_analog() {
 // ---- PWM / DAC output -------------------------------------------------------
 
 void Device::pwm_write(std::uint8_t pin, std::uint16_t duty) {
+  check_not_streaming("pwm_write");
   require_caps(pin, PinCaps::Pwm, "PWM");
   const std::uint16_t full_scale = max_value(_info.pwm_bits);
   if (duty > full_scale) {
@@ -274,6 +285,7 @@ void Device::pwm_write_fraction(std::uint8_t pin, double fraction) {
 }
 
 void Device::dac_write(std::uint8_t pin, std::uint16_t value) {
+  check_not_streaming("dac_write");
   require_caps(pin, PinCaps::Dac, "DAC");
   if (!_info.has_dac()) {
     throw NotSupported(fmt::format("the {} reports no DAC resolution",
@@ -305,6 +317,7 @@ void Device::dac_write_volts(std::uint8_t pin, double volts) {
 // ---- Control ----------------------------------------------------------------
 
 Status Device::status(std::uint8_t *queue_pending) {
+  check_not_streaming("status");
   std::array<std::byte, StatusReplyLen> reply{};
   read_in(Request::GetStatus, 0, reply, StatusReplyLen);
   if (queue_pending != nullptr) {
@@ -330,7 +343,122 @@ void Device::sync() {
   }
 }
 
-void Device::reset() { send_out(Request::Reset, 0, 0); }
+void Device::reset() {
+  check_not_streaming("reset");
+  send_out(Request::Reset, 0, 0);
+  _stream->selected.clear();
+}
+
+// ---- Streaming (Phase 2) -----------------------------------------------------
+
+void Device::check_not_streaming(std::string_view what) const {
+  if (_stream->streaming.load(std::memory_order_acquire)) {
+    throw DeviceBusy(
+        fmt::format("{}: a Stream is running on this device; only "
+                    "Stream::stats() and Stream::stop() may be used until "
+                    "it stops",
+                    what));
+  }
+}
+
+Stream Device::start_stream(StreamConfig config) {
+  check_not_streaming("start_stream");
+  if (!_info.streaming()) {
+    throw NotSupported(
+        fmt::format("the {} firmware does not report USBIO_FLAG_STREAMING",
+                    board_name(_info.board_id)));
+  }
+  if (config.pins.empty()) {
+    throw InvalidValue("start_stream: the pin list must not be empty");
+  }
+  if (config.pins.size() > _info.stream_max_channels) {
+    throw InvalidValue(fmt::format(
+        "start_stream: {} pins exceeds stream_max_channels ({})",
+        config.pins.size(), _info.stream_max_channels));
+  }
+  for (const std::uint8_t pin : config.pins) {
+    pin_caps(pin); // range check only (InvalidPin); mode is device-checked
+  }
+  {
+    // A duplicate would make STREAM_SELECT a no-op for the repeat (the
+    // device only ever adds a pin once), so the device's real channel
+    // count would fall short of config.pins.size() and every record would
+    // permanently fail Stream's n_samples check.
+    std::vector<std::uint8_t> sorted = config.pins;
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+      throw InvalidValue("start_stream: the pin list must not repeat a pin");
+    }
+  }
+  const auto period_raw = config.period.count();
+  if (period_raw < 0 || period_raw > 0xFFFF ||
+      (period_raw != 0 && period_raw < StreamMinPeriodUs)) {
+    throw InvalidValue(
+        fmt::format("start_stream: period {} us is outside 0 (free running) "
+                    "or {}..65535",
+                    period_raw, StreamMinPeriodUs));
+  }
+  const auto period_us = static_cast<std::uint16_t>(period_raw);
+
+  std::lock_guard<std::mutex> lock(_stream->mutex);
+  // STREAM_STOP keeps the selection: drop pins an earlier stream on this
+  // Device selected but the new configuration does not want.
+  for (const std::uint8_t pin : _stream->selected) {
+    if (std::find(config.pins.begin(), config.pins.end(), pin) ==
+        config.pins.end()) {
+      try {
+        send_out(Request::StreamSelect, 0, pin);
+      } catch (const Error &) {
+        // best effort; a stale pin here should not block starting the
+        // stream the caller actually asked for
+      }
+    }
+  }
+  std::vector<std::uint8_t> added;
+  try {
+    for (const std::uint8_t pin : config.pins) {
+      send_out(Request::StreamSelect, 1, pin);
+      added.push_back(pin);
+    }
+    send_out(Request::StreamStart, period_us, config.flags);
+  } catch (...) {
+    for (auto it = added.rbegin(); it != added.rend(); ++it) {
+      try {
+        send_out(Request::StreamSelect, 0, *it);
+      } catch (...) {
+        // best effort rollback: the original failure is what matters
+      }
+    }
+    throw;
+  }
+  _stream->selected = config.pins;
+  _stream->streaming.store(true, std::memory_order_release);
+  return Stream(*this, std::move(config));
+}
+
+StreamStatus Device::poll_stream_status() {
+  std::lock_guard<std::mutex> lock(_stream->mutex);
+  std::array<std::byte, StreamStatusLen> reply{};
+  const std::size_t n = raw_in(Request::StreamStatus, 0, reply);
+  if (n < StreamStatusLen) {
+    throw ProtocolError(fmt::format(
+        "GET_STREAM_STATUS: short reply ({} of {} bytes)", n, StreamStatusLen));
+  }
+  return decode_stream_status(reply);
+}
+
+void Device::end_stream() noexcept {
+  std::lock_guard<std::mutex> lock(_stream->mutex);
+  if (!_stream->streaming.load(std::memory_order_acquire)) {
+    return;
+  }
+  try {
+    send_out(Request::StreamStop, 0, 0);
+  } catch (...) {
+    // best effort: this runs from Stream's destructor and must not throw
+  }
+  _stream->streaming.store(false, std::memory_order_release);
+}
 
 // ---- Transfers --------------------------------------------------------------
 

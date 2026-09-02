@@ -55,7 +55,15 @@ inline void put_u16(uint8_t *dst, uint16_t v) {
 UsbIoDevice::UsbIoDevice()
     : _n_pins(0), _n_ain(0), _flags(0), _head(0), _tail(0), _epoch(0),
       _reset_requests(0), _reset_done(0), _last_error(USBIO_OK),
-      _ain_cursor(0) {
+      _ain_cursor(0)
+#if USBIO_HAS_STREAM_TRANSPORT
+      ,
+      _stream_n_channels(0), _stream_running(0), _stream_flags(0),
+      _stream_period_us(0), _stream_seq(0), _stream_overruns(0),
+      _stream_start_requests(0), _stream_start_done(0), _stream_deadline_us(0),
+      _stream_head(0), _stream_tail(0), _stream_tx_failures(0)
+#endif
+{
   for (unsigned p = 0; p < USBIO_MAX_PINS; ++p) {
     _caps[p] = 0;
     _mode[p] = ModeNone;
@@ -64,6 +72,10 @@ UsbIoDevice::UsbIoDevice()
   }
   memset(_queue, 0, sizeof(_queue));
   memset(_reply, 0, sizeof(_reply));
+#if USBIO_HAS_STREAM_TRANSPORT
+  memset(_stream_channels, 0, sizeof(_stream_channels));
+  memset(_stream_ring, 0, sizeof(_stream_ring));
+#endif
 }
 
 /* ---- setup ------------------------------------------------------------- */
@@ -172,6 +184,12 @@ void UsbIoDevice::request_reset() {
   for (uint8_t p = 0; p < _n_pins; ++p) {
     _mode[p] = (_caps[p] & USBIO_CAP_DIO) ? (uint8_t)USBIO_MODE_INPUT : ModeNone;
   }
+#if USBIO_HAS_STREAM_TRANSPORT
+  /* usbio_protocol.h, "Streaming": RESET stops a running stream and clears
+   * its selection (plain field writes, no Arduino I/O call - ISR-safe). */
+  _stream_running = 0;
+  _stream_n_channels = 0;
+#endif
   _reset_requests = (uint8_t)(_reset_requests + 1u);
 }
 
@@ -212,6 +230,24 @@ bool UsbIoDevice::handle_out(uint8_t bRequest, uint16_t wValue,
   case USBIO_REQ_RESET:
     request_reset();
     return true;
+  case USBIO_REQ_STREAM_SELECT:
+#if USBIO_HAS_STREAM_TRANSPORT
+    return handle_stream_select(wValue, wIndex);
+#else
+    return stall(USBIO_UNSUPPORTED);
+#endif
+  case USBIO_REQ_STREAM_START:
+#if USBIO_HAS_STREAM_TRANSPORT
+    return handle_stream_start(wValue, wIndex);
+#else
+    return stall(USBIO_UNSUPPORTED);
+#endif
+  case USBIO_REQ_STREAM_STOP:
+#if USBIO_HAS_STREAM_TRANSPORT
+    return handle_stream_stop();
+#else
+    return stall(USBIO_UNSUPPORTED);
+#endif
   case USBIO_REQ_PIN_MODE:
   case USBIO_REQ_DIO_WRITE:
   case USBIO_REQ_PWM_WRITE:
@@ -241,6 +277,13 @@ bool UsbIoDevice::handle_out(uint8_t bRequest, uint16_t wValue,
      * immediately must validate against the new mode (usbio_protocol.h,
      * "Mode bookkeeping"). */
     _mode[pin] = (uint8_t)wValue;
+#if USBIO_HAS_STREAM_TRANSPORT
+    /* usbio_protocol.h, "Streaming": changing the mode of a selected pin
+     * stops a running stream (the selection is left alone, like STOP). */
+    if (_stream_running && stream_channel_index(pin) >= 0) {
+      _stream_running = 0;
+    }
+#endif
     return true;
   case USBIO_REQ_DIO_WRITE:
     if (mode != USBIO_MODE_OUTPUT) {
@@ -290,6 +333,8 @@ bool UsbIoDevice::handle_in(uint8_t bRequest, uint16_t wIndex,
     info.vref_mv = UsbIoBoard::VrefMv;
     info.io_mv = UsbIoBoard::IoMv;
     info.flags = _flags;
+    info.stream_max_channels =
+        (_flags & USBIO_FLAG_STREAMING) ? (uint8_t)USBIO_MAX_STREAM_CHANNELS : 0;
     memcpy(_reply, &info, sizeof(info));
     len = sizeof(info);
     break;
@@ -372,6 +417,30 @@ bool UsbIoDevice::handle_in(uint8_t bRequest, uint16_t wIndex,
     len = off;
     break;
   }
+  case USBIO_REQ_STREAM_STATUS:
+#if USBIO_HAS_STREAM_TRANSPORT
+    if (!(_flags & USBIO_FLAG_STREAMING)) {
+      return stall(USBIO_UNSUPPORTED);
+    }
+    {
+      usbio_stream_status_t st;
+      memset(&st, 0, sizeof(st));
+      st.status = USBIO_OK;
+      st.running = _stream_running;
+      st.n_channels = _stream_n_channels;
+      st.flags = _stream_flags;
+      st.period_us = _stream_period_us;
+      /* _stream_seq is the seq the NEXT record will use (see stream_sample());
+       * report the last one actually produced, 0 before the first. */
+      st.seq = _stream_seq == 0 ? 0 : _stream_seq - 1u;
+      st.overruns = _stream_overruns;
+      memcpy(_reply, &st, sizeof(st));
+      len = sizeof(st);
+    }
+    break;
+#else
+    return stall(USBIO_UNSUPPORTED);
+#endif
   default:
     return stall(USBIO_BAD_CMD); /* unknown bRequest: the only IN request that STALLs */
   }
@@ -405,6 +474,9 @@ void UsbIoDevice::poll() {
      * otherwise a read could observe pre-reset hardware with an empty queue. */
   } while (_reset_done != _reset_requests);
   refresh_shadow();
+#if USBIO_HAS_STREAM_TRANSPORT
+  stream_poll();
+#endif
 }
 
 void UsbIoDevice::execute(const Command &c) {
@@ -512,3 +584,208 @@ uint16_t UsbIoDevice::read_analog(uint8_t pin) {
   }
   return v > 0xFFFF ? 0xFFFFu : (uint16_t)v;
 }
+
+/* ---- streaming ----------------------------------------------------------
+ * usbio_protocol.h, "Streaming": handle_stream_* run in the ISR exactly like
+ * handle_out()'s other cases (validate, update state, never touch Arduino
+ * I/O); stream_poll()/stream_sample() run from poll() like refresh_shadow().
+ * Both halves only exist when USBIO_HAS_STREAM_TRANSPORT (UsbIo.h).
+ */
+
+void UsbIoDevice::handle_usb_disconnected() {
+#if USBIO_HAS_STREAM_TRANSPORT
+  _stream_running = 0;
+  _stream_n_channels = 0;
+#endif
+}
+
+#if USBIO_HAS_STREAM_TRANSPORT
+
+int8_t UsbIoDevice::stream_channel_index(uint8_t pin) const {
+  for (uint8_t i = 0; i < _stream_n_channels; ++i) {
+    if (_stream_channels[i] == pin) {
+      return (int8_t)i;
+    }
+  }
+  return -1;
+}
+
+bool UsbIoDevice::handle_stream_select(uint16_t wValue, uint16_t wIndex) {
+  if (!(_flags & USBIO_FLAG_STREAMING)) {
+    return stall(USBIO_UNSUPPORTED);
+  }
+  if (_stream_running) {
+    return stall(USBIO_BUSY);
+  }
+  if (wIndex >= _n_pins) {
+    return stall(USBIO_BAD_PIN);
+  }
+  const uint8_t pin = (uint8_t)wIndex;
+  const uint8_t mode = _mode[pin];
+  if (mode != USBIO_MODE_ANALOG_IN && !mode_is_input(mode)) {
+    return stall(USBIO_BAD_MODE);
+  }
+  if (wValue > 1u) {
+    return stall(USBIO_BAD_VALUE);
+  }
+  const int8_t idx = stream_channel_index(pin);
+  if (wValue != 0) {
+    /* add: selecting an already-selected pin is a no-op */
+    if (idx >= 0) {
+      return true;
+    }
+    if (_stream_n_channels >= USBIO_MAX_STREAM_CHANNELS) {
+      return stall(USBIO_BAD_VALUE);
+    }
+    _stream_channels[_stream_n_channels] = pin;
+    ++_stream_n_channels;
+  } else {
+    /* remove: an unselected pin is a no-op */
+    if (idx < 0) {
+      return true;
+    }
+    for (uint8_t i = (uint8_t)idx; (uint8_t)(i + 1u) < _stream_n_channels; ++i) {
+      _stream_channels[i] = _stream_channels[i + 1u];
+    }
+    --_stream_n_channels;
+  }
+  return true;
+}
+
+bool UsbIoDevice::handle_stream_start(uint16_t wValue, uint16_t wIndex) {
+  if (!(_flags & USBIO_FLAG_STREAMING)) {
+    return stall(USBIO_UNSUPPORTED);
+  }
+  if (_stream_running) {
+    return stall(USBIO_BUSY);
+  }
+  if (_stream_n_channels == 0) {
+    return stall(USBIO_BAD_VALUE);
+  }
+  if (wValue != 0 && wValue < USBIO_STREAM_MIN_PERIOD_US) {
+    return stall(USBIO_BAD_VALUE);
+  }
+  const uint16_t known_flags =
+      (uint16_t)(USBIO_STREAM_FLAG_DIGITAL | USBIO_STREAM_FLAG_STOP_ON_OVERRUN);
+  if (wIndex & ~known_flags) {
+    return stall(USBIO_BAD_VALUE);
+  }
+  _stream_period_us = wValue;
+  _stream_flags = (uint8_t)wIndex;
+  _stream_running = 1;
+  /* The actual seq/overruns/ring reset happens in stream_poll(): touching
+   * ring indices here could race a poll() call mid-drain (same reasoning as
+   * _reset_requests/_reset_done for RESET). */
+  ++_stream_start_requests;
+  return true;
+}
+
+bool UsbIoDevice::handle_stream_stop() {
+  if (!(_flags & USBIO_FLAG_STREAMING)) {
+    return stall(USBIO_UNSUPPORTED);
+  }
+  _stream_running = 0; /* selection and any already-queued records are kept */
+  return true;
+}
+
+void UsbIoDevice::stream_poll() {
+  if (_stream_start_done != _stream_start_requests) {
+    _stream_start_done = _stream_start_requests;
+    _stream_head = 0;
+    _stream_tail = 0;
+    _stream_seq = 0;
+    _stream_overruns = 0;
+    _stream_tx_failures = 0;
+    _stream_deadline_us = micros();
+  }
+  if (_stream_running) {
+    const uint32_t now = micros();
+    const bool due =
+        _stream_period_us == 0 || (int32_t)(now - _stream_deadline_us) >= 0;
+    if (due) {
+      stream_sample(now);
+      if (_stream_period_us != 0) {
+        _stream_deadline_us += _stream_period_us;
+      }
+    }
+  }
+  /* Drain whatever the ring holds - not just what was just sampled - so a
+   * backlog left over from a busy transport keeps draining even on a poll()
+   * call that samples nothing (period not yet due, or the stream stopped). */
+  while (_stream_tail != _stream_head) {
+    const StreamRecord &rec =
+        _stream_ring[_stream_tail & (uint8_t)(StreamRingDepth - 1u)];
+    const uint8_t result = usbio_transport_stream_write(rec.data, rec.len);
+    if (result == USBIO_STREAM_WRITE_BUSY) {
+      break; /* previous packet still in flight; retry next poll() */
+    }
+    if (result == USBIO_STREAM_WRITE_FAILED) {
+      /* The host is not draining the endpoint. Give it StreamTxFailureLimit
+       * tries, then stop the stream and drop the backlog: leaving records
+       * queued would keep the drain loop above paying the transport's send
+       * timeout on every poll() for as long as the sketch runs. The dropped
+       * records are counted as overruns, and GET_STREAM_STATUS then reports
+       * running == 0, so a host that comes back sees exactly what happened. */
+      if (++_stream_tx_failures < StreamTxFailureLimit) {
+        break;
+      }
+      _stream_running = 0;
+      _stream_overruns += (uint8_t)(_stream_head - _stream_tail);
+      _stream_tail = _stream_head;
+      _stream_tx_failures = 0;
+      break;
+    }
+    _stream_tx_failures = 0;
+    _stream_tail = (uint8_t)(_stream_tail + 1u);
+  }
+}
+
+void UsbIoDevice::stream_sample(uint32_t now) {
+  uint8_t buf[StreamRecordMaxLen];
+  usbio_stream_header_t hdr;
+  hdr.magic = USBIO_STREAM_MAGIC;
+  hdr.n_samples = _stream_n_channels;
+  hdr.seq = _stream_seq;
+  hdr.t_us = now;
+  memcpy(buf, &hdr, sizeof(hdr));
+  uint16_t off = sizeof(hdr);
+  for (uint8_t i = 0; i < _stream_n_channels; ++i) {
+    const uint8_t pin = _stream_channels[i];
+    const uint16_t v = _mode[pin] == USBIO_MODE_ANALOG_IN
+                            ? read_analog(pin)
+                            : (uint16_t)read_pin(pin);
+    put_u16(&buf[off], v);
+    off = (uint16_t)(off + 2u);
+  }
+  if (_stream_flags & USBIO_STREAM_FLAG_DIGITAL) {
+    /* Same bitmap as DIO_READ_ALL: the poll()-refreshed _dio shadow, not a
+     * fresh digitalRead() per pin. */
+    const uint16_t nbytes = (uint16_t)((_n_pins + 7u) / 8u);
+    memset(&buf[off], 0, nbytes);
+    for (uint8_t p = 0; p < _n_pins; ++p) {
+      if (mode_is_digital(_mode[p]) && _dio[p]) {
+        buf[off + (p >> 3)] |= (uint8_t)(1u << (p & 7u));
+      }
+    }
+    off = (uint16_t)(off + nbytes);
+    if (off & 1u) {
+      buf[off] = 0; /* pad to an even record length */
+      ++off;
+    }
+  }
+  ++_stream_seq; /* bumped even when the record below is dropped: the host
+                  * sees the drop as a gap between the seq values it did get */
+  if ((uint8_t)(_stream_head - _stream_tail) >= StreamRingDepth) {
+    ++_stream_overruns;
+    if (_stream_flags & USBIO_STREAM_FLAG_STOP_ON_OVERRUN) {
+      _stream_running = 0;
+    }
+    return;
+  }
+  StreamRecord &slot = _stream_ring[_stream_head & (uint8_t)(StreamRingDepth - 1u)];
+  slot.len = (uint8_t)off;
+  memcpy(slot.data, buf, off);
+  _stream_head = (uint8_t)(_stream_head + 1u);
+}
+
+#endif /* USBIO_HAS_STREAM_TRANSPORT */

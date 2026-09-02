@@ -9,13 +9,18 @@ add_library(arduino_driver_fake STATIC
 add_library(ArduinoDriver::fake ALIAS arduino_driver_fake)
 arduinodriver_configure_target(arduino_driver_fake)
 target_include_directories(arduino_driver_fake PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(arduino_driver_fake PUBLIC ArduinoDriver::arduino_driver)
+# FakeTransport's bulk model runs a Stream worker thread concurrently with
+# the test thread (see FakeTransport.h): PUBLIC so the pthread requirement
+# (Linux/glibc) reaches arduino_driver_tests at final link time too.
+target_link_libraries(arduino_driver_fake PUBLIC ArduinoDriver::arduino_driver Threads::Threads)
 
 add_executable(arduino_driver_tests
   TestRig.h
   test_protocol_encoding.cpp
   test_device_api.cpp
   test_enumeration.cpp
+  test_stream_decoding.cpp
+  test_stream_api.cpp
   test_hardware.cpp # [.hardware]: hidden unless selected explicitly
 )
 arduinodriver_configure_target(arduino_driver_tests)

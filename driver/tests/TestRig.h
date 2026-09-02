@@ -6,7 +6,9 @@
 #include "arduino_driver/Device.h"
 
 #include <chrono>
+#include <cstddef>
 #include <memory>
+#include <span>
 #include <utility>
 
 namespace ArduinoDriver::Testing {
@@ -52,6 +54,10 @@ public:
                    std::uint16_t index,
                    std::chrono::milliseconds timeout) override {
     _target.control_out(request, value, index, timeout);
+  }
+  std::size_t bulk_in(std::span<std::byte> data,
+                      std::chrono::milliseconds timeout) override {
+    return _target.bulk_in(data, timeout);
   }
 
 private:

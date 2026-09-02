@@ -138,7 +138,8 @@ Dedicated vendor interface (SAMD, mbed, RP2040, ESP32): class `0xFF`, subclass `
   `GET_INFO` with `n_pins == 0` means "sketch not started"; `last_error`
   records IN STALLs too; the mbed/SAMD vendor interface lands at interface 0
   with CDC at 1-2; GIGA exposes the core's full 103-pin digital table.
-- Next: phase 2 below (bulk endpoints for continuous sampling).
+- Next: phase 2 below (bulk endpoints for continuous sampling) — implemented
+  and hardware-verified, see its own status entry at the end.
 
 ## Phase 2 — bulk endpoints for continuous sampling
 
@@ -278,3 +279,60 @@ after a host-side loss. The digital bitmap (flags bit0) is appended after
 - A second bulk OUT endpoint for waveform output (DAC/PWM playback) would use
   the same framing in reverse; deliberately deferred until the IN path is
   verified on hardware.
+
+### Status (2026-09-03)
+
+Implemented as planned: the contract in `usbio_protocol.h` was frozen first,
+then the two halves were written in parallel by sub-agents on disjoint
+subtrees (firmware `arduino/UsbIo/**`, driver `driver/**`), neither touching
+the protocol header, and both reviewed and corrected here.
+
+- Firmware: streaming state machine, `micros()` deadline scheduler and a
+  32-slot record ring in `poll()`; mbed bulk IN endpoint (Tier 1), SAMD
+  (Tier 2). All nine FQBNs compile warning-free, the Nano RP2040 Connect
+  (mbed, so it gains streaming too) checked separately. Portenta +1800 B flash /
+  +1544 B RAM; UNO R4 Minima +32 B / +0 B, with `nm` confirming zero stream
+  symbols in the Renesas image (the feature genuinely compiles out).
+- Driver: `Transport::bulk_in`, bulk endpoint discovery, an 8-transfer
+  always-armed libusb async ring, `Stream` + worker thread with resync-capable
+  reassembly, the `stream` CLI verb. 60/60 tests pass (15 new) with
+  warnings-as-errors, and clean under TSan and ASan/UBSan.
+- Hardware (Portenta H7): 2 channels at 1 kHz for 3.028 s — 3029 records,
+  6058 samples, 1000.4 Hz achieved per channel, zero device overruns, seq
+  gaps, host drops and resyncs. First end-to-end proof of the bulk path.
+
+Deviations from the phase 2 design above:
+
+- Records never straddle packets in practice: the channel and pin limits bound
+  one at 44 B, under the 64 B endpoint (compile-time asserted), so the device
+  emits whole records and its ring holds records rather than raw bytes. The
+  host reassembler still implements straddling, as the wire contract allows it.
+- The transport hook returns SENT/BUSY/FAILED, not a bool: on mbed a refused
+  write is ordinary backpressure, while on SAMD it means the core's blocking
+  `send()` burned its 70 ms timeout. Conflating them would either kill healthy
+  streams or stall `loop()` for ever, so the core counts only FAILED and stops
+  the stream (dropping its backlog) after three consecutive ones.
+- mbed raises the in-flight flag *before* arming the transfer and marks it
+  `volatile`: a completion interrupt landing between arming and the assignment
+  would otherwise leave the flag high with nothing in flight, silently killing
+  the stream. `USBCDC` avoids this with `lock()`, which a `PluggableUSBModule`
+  cannot take.
+- `stream_max_channels` is 8, ring depth 32 records (~1.4 kB).
+- The driver rejects duplicate pins in `StreamConfig`: the device dedupes them
+  through `STREAM_SELECT` no-ops, which would desync the host's channel map.
+
+Left open:
+
+- Rate ceiling still unmeasured (`--period-us 0` free-run); the README says
+  "bounded by the sketch's loop rate" without a number.
+- The digital bitmap is framed and parsed but not surfaced through `Sample` or
+  the CLI, so `USBIO_STREAM_FLAG_DIGITAL` is not usable from the host yet.
+- `Stream::stats().seq_gaps` accumulates unsigned, so a backwards `seq` (a
+  device restarting mid-stream) would add ~2^32 instead of 0.
+- SAMD streaming compiles and is wired but has never run on hardware; Windows
+  is unverified until CI builds the new worker-thread code under MSVC.
+- A `STREAM_SELECT` remove is rejected with `BAD_MODE` when the pin's mode
+  changed after selection, because the contract orders the mode check before
+  the add/remove split. Harmless, but a reconfigured pin can then only be
+  dropped by `RESET` or by restarting the selection.
+- No `[.hardware]` streaming test: the run above was manual.
