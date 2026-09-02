@@ -4,6 +4,19 @@
 
 #include "arduino_driver/Enumerator.h"
 
+// libusb declares its event-loop API with `struct timeval *` but deliberately
+// skips <sys/time.h> under MSVC (libusb.h: `#if !defined(_MSC_VER)`), so the
+// struct stays incomplete there: passing a pointer compiles, *defining* one
+// does not. Windows declares it in <winsock2.h>, which must come before
+// <libusb.h> because that header pulls in <windows.h>, and the legacy
+// <winsock.h> arriving first would clash with <winsock2.h>. Every translation
+// unit that talks to libusb includes this header before <libusb.h>.
+#if defined(_WIN32)
+#include <winsock2.h>
+#else
+#include <sys/time.h>
+#endif
+
 #include <libusb.h>
 
 #include <cstdint>
