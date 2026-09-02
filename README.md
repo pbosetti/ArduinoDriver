@@ -1,5 +1,7 @@
 # ArduinoDriver
 
+[![Driver CI](https://github.com/MADS-NET/ArduinoDriver/actions/workflows/driver-ci.yml/badge.svg)](https://github.com/MADS-NET/ArduinoDriver/actions/workflows/driver-ci.yml)
+
 Turn an Arduino board into a USB vendor-class I/O peripheral — digital I/O,
 analog input, PWM and DAC — and drive it from a C++20 host library built on
 libusb. No serial port, no text protocol: the host talks to the board with USB
