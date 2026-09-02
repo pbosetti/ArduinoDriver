@@ -118,3 +118,21 @@ Dedicated vendor interface (SAMD, mbed, RP2040, ESP32): class `0xFF`, subclass `
 - `cmake -Bbuild -G Ninja && cmake --build build && ctest --test-dir build --output-on-failure` — all non-hardware Catch2 tests pass on macOS/clang.
 - `cmake --build build --target firmware-portenta` (and the other Tier-1 FQBNs) — clean compile, no warnings from our library.
 - Hardware (user, Portenta H7): flash example → `system_profiler SPUSBDataType` shows an extra vendor interface; `build/driver/arduino-io list` finds it; `info` prints board id/pins; `mode 23 output && write 23 0` lights the red LED; `aread 15` (A0) returns a plausible value; `pwm` on a PWM-capable pin; `ctest -R hardware` with `ARDUINO_IO_HW=1`.
+
+## Status (2026-09-02)
+
+- Firmware: complete. Nine FQBNs compile warning-free (Portenta H7, GIGA R1,
+  Nano 33 BLE, Nano RP2040 Connect, UNO R4 Minima, Nano R4, Zero, MKR Zero,
+  Nano 33 IoT); RP2040 (arduino-pico) and ESP32 shims are written but
+  unverified; Teensy/STM32 deferred. Recipient policy (device vs interface
+  form) lives in `UsbIoDevice::handle_setup()`; transports pass raw packets.
+- Driver: complete. `Device` over an abstract `Transport`, `LibusbTransport`
+  (+ interface-recipient option), `Enumerator` (descriptor match, then
+  VID-allow-listed GET_INFO probe), `arduino-io` CLI, Catch2 suites on an
+  in-process firmware model, hidden `[.hardware]` suite.
+- Hardware verification: none yet. First target is the user's Portenta H7
+  (checklist in README). Findings from the bring-up go here.
+- Deviations from the plan above: pins are unconfigured at boot (not INPUT);
+  `GET_INFO` with `n_pins == 0` means "sketch not started"; `last_error`
+  records IN STALLs too; the mbed/SAMD vendor interface lands at interface 0
+  with CDC at 1-2; GIGA exposes the core's full 103-pin digital table.

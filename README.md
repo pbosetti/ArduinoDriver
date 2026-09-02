@@ -189,9 +189,11 @@ Nano RP2040 Connect D24–D29) they are addressable, exactly as a sketch could
 
 ## Operating-system notes
 
-- **macOS** — no driver needed. libusb opens the composite device and issues
-  EP0 vendor requests even though the CDC interfaces belong to `AppleUSBACM`
-  (dfu-util relies on the same behaviour to program the UNO R4).
+- **macOS** — no driver needed. `AppleUSBACM` holds the CDC interfaces, so
+  libusb cannot open the device exclusively; its darwin backend tolerates
+  that and still sends EP0 requests straight to the device (dfu-util programs
+  the UNO R4 through the same path). Claiming the UsbIo interface is optional
+  here; the driver does it by default for exclusivity between processes.
 - **Linux** — copy `driver/etc/99-arduino-usbio.rules` to
   `/etc/udev/rules.d/`, then `sudo udevadm control --reload && sudo udevadm trigger`,
   or run as root. The rule grants access for the Arduino, Raspberry Pi and
