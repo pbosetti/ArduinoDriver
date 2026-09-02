@@ -1,0 +1,15 @@
+# 99-arduino-usbio.rules - let console users talk to UsbIo boards without root.
+#
+# Grants read/write access to every USB device of the three vendor ids the
+# driver probes (Arduino, Raspberry Pi, Espressif). TAG+="uaccess" gives the
+# logged-in seat user an ACL (systemd-logind); MODE="0666" covers systems
+# without logind. Tighten to a product id (ATTR{idProduct}=="xxxx") if
+# needed.
+#
+# Install:
+#   sudo cp 99-arduino-usbio.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then re-plug the board.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2341", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="303a", MODE="0666", TAG+="uaccess"

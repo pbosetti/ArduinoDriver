@@ -1,0 +1,101 @@
+// LibusbTransport.h - Transport over libusb-1.0 (real hardware).
+#pragma once
+
+#include "arduino_driver/Errors.h"
+#include "arduino_driver/Protocol.h"
+#include "arduino_driver/Transport.h"
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+
+// libusb.h stays out of the public headers; these match its typedefs.
+struct libusb_context;
+struct libusb_device;
+struct libusb_device_handle;
+
+namespace ArduinoDriver {
+
+/// RAII libusb_context. Create one per process (std::make_shared<Context>())
+/// and hand it to the enumeration functions and transports, which keep it
+/// alive for as long as they need it.
+class Context {
+public:
+  /// Throws UsbError when libusb cannot be initialised.
+  Context();
+  ~Context();
+  Context(const Context &) = delete;
+  Context &operator=(const Context &) = delete;
+
+  libusb_context *native() const noexcept { return _context; }
+  /// libusb message verbosity: 0 none, 1 error, 2 warning, 3 info, 4 debug.
+  void set_log_level(int level);
+
+private:
+  libusb_context *_context{nullptr};
+};
+
+struct LibusbTransportOptions {
+  /// Request form; Interface needs the vendor interface (see Recipient).
+  Recipient recipient{Recipient::Device};
+  /// Claim the vendor interface when the device has one. Claiming gives
+  /// exclusivity between processes using the board, is required for the
+  /// Interface recipient form and on Windows (WinUSB handles are per
+  /// interface). It is optional on macOS and Linux: EP0 vendor requests
+  /// travel on the device handle, which libusb opens even when another
+  /// driver (CDC) holds the other interfaces.
+  bool claim_interface{true};
+};
+
+/// Vendor control transfers to one open libusb device. Opens the device on
+/// construction, claims the UsbIo vendor interface when present (and
+/// requested), releases and closes on destruction.
+class LibusbTransport final : public Transport {
+public:
+  /// Throws std::invalid_argument for null arguments, NotSupported when the
+  /// Interface form is requested on a device without the vendor interface,
+  /// UsbError when the device cannot be opened or the interface claimed
+  /// (permissions: udev rule on Linux, WinUSB binding on Windows).
+  LibusbTransport(std::shared_ptr<Context> context, libusb_device *device,
+                  LibusbTransportOptions options = {});
+  ~LibusbTransport() override;
+
+  std::size_t control_in(std::uint8_t request, std::uint16_t value,
+                         std::uint16_t index, std::span<std::byte> data,
+                         std::chrono::milliseconds timeout) override;
+  void control_out(std::uint8_t request, std::uint16_t value,
+                   std::uint16_t index,
+                   std::chrono::milliseconds timeout) override;
+
+  /// True when the configuration descriptor carries the UsbIo interface.
+  bool has_vendor_interface() const noexcept { return _interface.has_value(); }
+  /// Number of the UsbIo interface, when present.
+  std::optional<std::uint8_t> interface_number() const noexcept {
+    return _interface;
+  }
+  /// True when the interface was claimed by this transport.
+  bool interface_claimed() const noexcept { return _claimed; }
+  Recipient recipient() const noexcept { return _options.recipient; }
+  const std::shared_ptr<Context> &context() const noexcept { return _context; }
+  libusb_device_handle *native_handle() const noexcept { return _handle; }
+
+private:
+  /// One libusb_control_transfer with error mapping; returns bytes moved.
+  int transfer(std::uint8_t request_type, std::uint8_t request,
+               std::uint16_t value, std::uint16_t index,
+               std::span<std::byte> data, std::chrono::milliseconds timeout);
+  /// wIndex on the wire for the selected recipient form.
+  std::uint16_t wire_index(std::uint16_t index) const;
+  void close() noexcept;
+
+  std::shared_ptr<Context> _context;
+  LibusbTransportOptions _options;
+  libusb_device_handle *_handle{nullptr};
+  std::optional<std::uint8_t> _interface;
+  bool _claimed{false};
+};
+
+} // namespace ArduinoDriver

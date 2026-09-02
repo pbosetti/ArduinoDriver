@@ -102,7 +102,13 @@ arduino-io mode 13 output && arduino-io write 13 1
 arduino-io mode 14 analog  && arduino-io aread 14 --volts
 arduino-io mode 9 pwm      && arduino-io pwm 9 50%
 arduino-io monitor --hz 10 14 15    # stream reads until Ctrl-C
+arduino-io --help                   # full command list
 ```
+
+`list` needs no board and also shows devices it could not probe (typically a
+permissions problem) in a separate block; every other command opens the first
+identified device unless `--serial` is given. Exit codes: 0 ok, 1 device or
+protocol error (message on stderr), 2 usage.
 
 From C++:
 
