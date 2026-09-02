@@ -130,9 +130,151 @@ Dedicated vendor interface (SAMD, mbed, RP2040, ESP32): class `0xFF`, subclass `
   (+ interface-recipient option), `Enumerator` (descriptor match, then
   VID-allow-listed GET_INFO probe), `arduino-io` CLI, Catch2 suites on an
   in-process firmware model, hidden `[.hardware]` suite.
-- Hardware verification: none yet. First target is the user's Portenta H7
-  (checklist in README). Findings from the bring-up go here.
+- Hardware verification: **Portenta H7 done** — the README bring-up checklist
+  passes end to end on the user's board (enumeration with the extra vendor
+  interface, `list`/`info`, LED writes, analog read, PWM, hardware test suite).
+  Findings from further boards go here.
 - Deviations from the plan above: pins are unconfigured at boot (not INPUT);
   `GET_INFO` with `n_pins == 0` means "sketch not started"; `last_error`
   records IN STALLs too; the mbed/SAMD vendor interface lands at interface 0
   with CDC at 1-2; GIGA exposes the core's full 103-pin digital table.
+- Next: phase 2 below (bulk endpoints for continuous sampling).
+
+## Phase 2 — bulk endpoints for continuous sampling
+
+Goal: sustained, device-timestamped sampling of a selected pin set, streamed
+over a bulk IN endpoint instead of one control transfer per reading (today's
+ceiling: one operation per ~1 ms frame). Control transfers stay the command
+channel; the bulk endpoint carries sample records only.
+
+### Feasibility per transport
+
+- **mbed** (Portenta H7 — verified hardware, GIGA, Nano 33 BLE): the module's
+  `init(EndpointResolver &)` — today an empty override in
+  `transport/pluggable_mbed.cpp:117` — claims
+  `resolver.endpoint_in(USB_EP_TYPE_BULK, 64)`, and `configuration_desc()`
+  grows one endpoint descriptor with `bNumEndpoints` 0 → 1. Writes happen from
+  `poll()` through the module's non-blocking send, never from the setup
+  callback. **Tier 1: implement and verify here first.**
+- **SAMD21** (Zero, MKR*, Nano 33 IoT): module ctor becomes
+  `PluggableUSBModule(1, 1, epType)` with `EP_TYPE_BULK_IN`, `getInterface()`
+  emits the endpoint descriptor, data goes out via `USBDevice.send()`. One
+  64-byte packet per frame → ~64 kB/s ceiling. Tier 2.
+- **Renesas** (Uno R4 Minima, Nano R4): descriptors are hardcoded in the core's
+  `usb/USB.cpp` and there is no vendor interface to hang an endpoint on →
+  **not supportable without a patched core**. Firmware simply reports no
+  streaming flag; the driver reports `NotSupported`.
+- **RP2040 / ESP32**: transports are still unverified for control I/O;
+  streaming deferred until those are validated on hardware.
+
+### Protocol additions (no version bump)
+
+Streaming only adds request codes, one info flag and one reserved byte, so
+`USBIO_PROTOCOL_VERSION` stays `0x0001`: `Device.cpp:100` requires an exact
+version match, so bumping it would break every existing firmware/driver pair
+for a purely additive feature. Capability discovery goes through the flag, and
+firmware without streaming STALLs the new requests with `BAD_CMD` anyway.
+
+| bRequest | dir | wIndex | wValue | data |
+|---|---|---|---|---|
+| `0x30 STREAM_SELECT` | OUT | pin | 0 remove / 1 add | – |
+| `0x31 STREAM_START` | OUT | flags | period_us (0 = free-run) | – |
+| `0x32 STREAM_STOP` | OUT | – | – | – |
+| `0x33 GET_STREAM_STATUS` | IN | – | – | `usbio_stream_status_t` {status, running u8, n_channels u8, period_us u16, seq u32, overruns u32} |
+
+- The channel set is built one pin per request so that no request needs an OUT
+  data stage — the constraint that shaped the whole protocol. Selected pins
+  must already be in `ANALOG_IN` or a DIO input mode (else STALL `BAD_MODE`);
+  `STREAM_SELECT` while running STALLs `BUSY`.
+- `wValue = period_us` (1..65535 µs ≈ 15 Hz..1 MHz nominal). The rate is
+  best-effort; what the device actually achieved is read back through
+  `GET_STREAM_STATUS` and `t_us` deltas.
+- `STREAM_START` flags: bit0 append the digital bitmap to every record,
+  bit1 stop on overrun instead of dropping.
+- New `USBIO_FLAG_STREAMING = 1u << 2`; `usbio_info_t.reserved[0]` becomes
+  `stream_max_channels` (0 when the build has no streaming), keeping the
+  struct at 24 bytes.
+
+### Record format (bulk IN, little-endian)
+
+```
+usbio_stream_record_t {
+  uint16_t magic;      /* 'US' — lets the host resync after a loss */
+  uint16_t n_samples;  /* channels in this record                  */
+  uint32_t seq;        /* record counter; gaps == device drops     */
+  uint32_t t_us;       /* micros() at sample time                  */
+  uint16_t samples[];  /* one per selected pin, in selection order */
+}
+```
+
+The endpoint carries a continuous byte stream: the firmware writes whole
+packets, records may straddle packet boundaries, and the host reassembles.
+`seq` gaps are how the host detects device-side drops, `magic` allows resync
+after a host-side loss. The digital bitmap (flags bit0) is appended after
+`samples`.
+
+### Firmware
+
+- Sampling stays in `poll()` — the ISR rule is unchanged. A `micros()` deadline
+  scheduler samples the selected pins, formats one record into an SPSC ring
+  (~2 kB), then pushes as many whole packets as the endpoint accepts without
+  blocking. Ring full → drop the newest record and `overruns++` (the seq gap
+  tells the host what was lost).
+- Consequence to document: jitter is bounded by the sketch's loop time, and
+  `t_us` — not host arrival time — is the timing reference. Timer/DMA-driven
+  sampling is explicitly out of scope for this phase.
+- `RESET`, USB suspend and disconnect stop the stream and clear the selection.
+
+### Driver
+
+- `Transport` gains `bulk_in(std::span<std::byte>, timeout) -> size_t`;
+  `LibusbTransport` locates the bulk IN endpoint in the vendor interface
+  descriptor at open time (`Enumerator` already walks config descriptors) and
+  records its address and max packet size.
+- New `Stream.h`: `Device::start_stream(StreamConfig{pins, period, flags})`
+  returns an RAII `Stream` that stops the device in its destructor. `Stream`
+  runs a worker thread over the libusb **async** API — a ring of ~8 in-flight
+  `libusb_submit_transfer` of 8–16 packets each, driven by
+  `libusb_handle_events_timeout` — because synchronous reads leave the endpoint
+  idle between calls and lose samples at rate.
+- Consumer API: `read(std::span<Sample>, timeout) -> size_t` for decoded
+  records plus an optional `on_records` callback; `Stream::stats()` reports
+  device overruns, host-side drops and seq gaps. `Sample` carries pin, raw,
+  volts and `t_us`.
+- Threading: `Device` stays not-thread-safe. A running `Stream` owns the bulk
+  path; while it runs only `GET_STREAM_STATUS`/`STREAM_STOP` are allowed
+  (serialized inside `Device`), other calls throw `DeviceBusy`.
+- CLI: `arduino-io stream <pins> [--hz N | --period-us N] [--seconds N]
+  [--volts] [--csv FILE]`, CSV on stdout plus a final summary line with the
+  achieved rate and the drop counts.
+
+### Tests
+
+- `FakeTransport` grows a bulk endpoint model: synthetic records with a
+  programmable ramp, injectable seq gaps, short reads, records straddling
+  packet boundaries, and zero-length packets.
+- `test_stream_decoding`: framing, straddling reassembly, resync via `magic`
+  after injected garbage, seq-gap accounting, digital-bitmap layout.
+- `test_stream_api`: select/start/stop sequencing, `BAD_MODE` on an
+  unconfigured pin, `DeviceBusy` for control calls during a stream,
+  `NotSupported` when the info flag is clear, destructor stops the device.
+- `[.hardware]`: 4 channels at 1 kHz for 10 s on the Portenta — zero seq gaps,
+  `t_us` deltas within tolerance, achieved rate close to requested.
+
+### Implementation order
+
+1. Protocol header additions (written once, applied to both sides, as before).
+2. mbed firmware: endpoint, ring, scheduler; confirm enumeration still shows
+   CDC plus the vendor interface and that existing control I/O is unaffected.
+3. Driver: `bulk_in`, endpoint discovery, `Stream` + async worker, CLI verb.
+4. Tests against the fake bulk model, then the hardware run on the Portenta.
+5. SAMD port; re-run the FQBN compile matrix; document the 64 kB/s ceiling.
+6. README: streaming section, board-matrix column, Renesas exclusion.
+
+### Open questions
+
+- Actual rate ceiling on the H7 poll loop (cost of `analogRead` per channel) —
+  measure before quoting a number in the README.
+- A second bulk OUT endpoint for waveform output (DAC/PWM playback) would use
+  the same framing in reverse; deliberately deferred until the IN path is
+  verified on hardware.
