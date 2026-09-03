@@ -348,3 +348,8 @@ Nano RP2040 Connect D24–D29) they are addressable, exactly as a sketch could
 - Planned: MS OS 2.0 descriptors for automatic WinUSB binding; Teensy 4.x and
   STM32duino transports (patched core); RP2040 (arduino-pico) and ESP32
   verification once those cores are available.
+
+
+# Author and License
+
+Author is Paolo Bosetti, University of Trento. Distributed under the Apache 2.0 License. See [LICENSE](LICENSE) for details.
