@@ -76,6 +76,33 @@
  * whole packets, a record may straddle packet boundaries, and the host
  * reassembles. Every record starts with USBIO_STREAM_MAGIC so a host that lost
  * sync can resynchronise, and record lengths are always even.
+ *
+ * Pin events (USBIO_FLAG_EVENTS)
+ * ------------------------------
+ * EVENT_CONFIG arms a DIO input pin for edge reporting; the device then queues
+ * one usbio_event_t per accepted edge and counts them per pin. EVENT_POP
+ * drains the queue, EVENT_COUNTS reads the counters. Both are plain control
+ * transfers, so events work on every board - the Renesas boards included,
+ * which have no endpoint to stream over.
+ *
+ * Edges are detected by *scanning*, not by a hardware interrupt: poll()
+ * compares the digital shadow it has just refreshed against the previous one.
+ * A pulse shorter than one loop() iteration can therefore be missed, which is
+ * fine for the intended use (buttons and other human-scale contacts) and is
+ * not suitable for tachometers or encoders. The wire contract does not depend
+ * on this: a board could later detect the same edges with attachInterrupt()
+ * without any host-visible change.
+ *
+ * Debounce (high byte of EVENT_CONFIG's wValue, 0..255 ms) is "first edge
+ * wins": once an edge is accepted on a pin, further edges on that pin are
+ * ignored until the window has passed. 0 disables it. Bounce is therefore
+ * absorbed on the device, not by the host.
+ *
+ * The queue is bounded (USBIO_EVENT_QUEUE_DEPTH). When it fills, the newest
+ * edge is dropped and the header's `dropped` counter reports how many were
+ * lost since the last pop - but the per-pin counters keep counting, so the
+ * host can always recover how many edges really occurred even if it cannot
+ * recover when each one happened.
  */
 #ifndef USBIO_PROTOCOL_H
 #define USBIO_PROTOCOL_H
@@ -139,6 +166,15 @@ enum usbio_request {
                                    *     wValue=period_us (0 = free running)    */
   USBIO_REQ_STREAM_STOP = 0x32,   /* OUT stop sampling, keep the selection      */
   USBIO_REQ_STREAM_STATUS = 0x33, /* IN  -> usbio_stream_status_t               */
+  USBIO_REQ_GET_TIME = 0x21,      /* IN  -> usbio_time_reply_t                  */
+  /* Pin events (only when USBIO_FLAG_EVENTS is set; else STALL UNSUPPORTED)   */
+  USBIO_REQ_EVENT_CONFIG = 0x40,  /* OUT wIndex=pin
+                                   *     wValue=(debounce_ms << 8) | edge mode  */
+  USBIO_REQ_EVENT_POP = 0x41,     /* IN  wIndex=max events (0 = as many as fit)
+                                   *     -> usbio_event_header_t + usbio_event_t[] */
+  USBIO_REQ_EVENT_COUNTS = 0x42,  /* IN  -> usbio_event_header_t + usbio_event_count_t[] */
+  /* 0x50..0x5F are reserved for the planned RPC block (call a handler the
+   * sketch registered; see PLAN.md). Unimplemented today: they STALL BAD_CMD. */
   USBIO_REQ_RESET = 0x7F          /* OUT all pins -> INPUT, queue cleared       */
 };
 
@@ -180,8 +216,20 @@ enum usbio_pin_caps {
 enum usbio_info_flags {
   USBIO_FLAG_VENDOR_INTERFACE = 1u << 0, /* device exposes the vendor interface */
   USBIO_FLAG_PULLDOWN = 1u << 1,         /* INPUT_PULLDOWN is supported         */
-  USBIO_FLAG_STREAMING = 1u << 2         /* bulk IN endpoint + STREAM_* requests;
+  USBIO_FLAG_STREAMING = 1u << 2,        /* bulk IN endpoint + STREAM_* requests;
                                           * stream_max_channels is then valid   */
+  USBIO_FLAG_EVENTS = 1u << 3            /* EVENT_* requests; event_max_pins is
+                                          * then valid                          */
+};
+
+/* Low byte of EVENT_CONFIG's wValue: which edges are reported for the pin.
+ * OFF removes the pin from the watch set. */
+enum usbio_edge_mode {
+  USBIO_EDGE_OFF = 0,
+  USBIO_EDGE_RISING = 1,  /* LOW -> HIGH                                       */
+  USBIO_EDGE_FALLING = 2, /* HIGH -> LOW                                       */
+  USBIO_EDGE_CHANGE = 3,  /* both                                              */
+  USBIO_EDGE_COUNT = 4
 };
 
 /* wIndex of STREAM_START. */
@@ -232,6 +280,14 @@ enum usbio_board_id {
 #define USBIO_STREAM_MIN_PERIOD_US 100u /* fastest period a device must accept;
                                          * 0 means free running                */
 
+/* Pin events. The per-pop and per-counts limits keep both replies inside the
+ * 64-byte EP0 buffer of the SAMD core, the smallest of the supported stacks:
+ * 4 + 7*8 = 60 and 4 + 8*4 = 36 bytes. */
+#define USBIO_MAX_EVENT_PINS 8u      /* pins that can be watched at once       */
+#define USBIO_EVENT_QUEUE_DEPTH 32u  /* device-side event ring                 */
+#define USBIO_MAX_EVENTS_PER_POP 7u  /* events one EVENT_POP can return        */
+#define USBIO_MAX_DEBOUNCE_MS 255u   /* high byte of EVENT_CONFIG's wValue     */
+
 /* ---- Reply layouts (naturally aligned, no packing pragmas needed) ------ */
 
 typedef struct usbio_info {
@@ -253,7 +309,9 @@ typedef struct usbio_info {
   uint16_t flags;                 /* enum usbio_info_flags                    */
   uint8_t stream_max_channels;    /* pins STREAM_SELECT accepts at once; 0 when
                                    * USBIO_FLAG_STREAMING is clear            */
-  uint8_t reserved[3];            /* zero                                     */
+  uint8_t event_max_pins;         /* pins EVENT_CONFIG watches at once; 0 when
+                                   * USBIO_FLAG_EVENTS is clear               */
+  uint8_t reserved[2];            /* zero                                     */
 } usbio_info_t;
 USBIO_STATIC_ASSERT(sizeof(usbio_info_t) == 24, "usbio_info_t must be 24 bytes");
 
@@ -294,6 +352,55 @@ typedef struct usbio_status_reply {
   uint8_t reserved;      /* zero                                             */
 } usbio_status_reply_t;
 USBIO_STATIC_ASSERT(sizeof(usbio_status_reply_t) == 4, "usbio_status_reply_t must be 4 bytes");
+
+/* GET_TIME. Served straight from the setup callback - millis() and micros()
+ * are lock-free ticker reads on every supported stack - so the values are the
+ * device's clock at the moment the request arrived, not at the last poll().
+ *
+ * micros wraps every ~71.6 minutes and millis every ~49.7 days, but the two
+ * together pin down a 64-bit microsecond clock: micros == millis * 1000 modulo
+ * 2^32, so a host that reads both can rebuild the high word without any
+ * device-side bookkeeping. That is what anchors the raw t_us of stream records
+ * and the t_ms of pin events to host time. */
+typedef struct usbio_time_reply {
+  uint8_t status;    /* always OK                                             */
+  uint8_t reserved;  /* zero                                                  */
+  uint16_t reserved2;/* zero                                                  */
+  uint32_t millis;   /* millis() when the request was served                  */
+  uint32_t micros;   /* micros() at the same instant                          */
+} usbio_time_reply_t;
+USBIO_STATIC_ASSERT(sizeof(usbio_time_reply_t) == 12, "usbio_time_reply_t must be 12 bytes");
+
+/* Header of the EVENT_POP and EVENT_COUNTS replies; the array follows. */
+typedef struct usbio_event_header {
+  uint8_t status;  /* always OK on an events build                            */
+  uint8_t count;   /* entries that follow                                     */
+  uint8_t dropped; /* EVENT_POP: events the ring had to drop since the last
+                    * pop (saturates at 255). The per-pin counters below stay
+                    * exact regardless, so a drop never loses a press count.  */
+  uint8_t pending; /* EVENT_POP: events still queued after this reply         */
+} usbio_event_header_t;
+USBIO_STATIC_ASSERT(sizeof(usbio_event_header_t) == 4, "usbio_event_header_t must be 4 bytes");
+
+/* One edge, as reported by EVENT_POP in the order the device detected them. */
+typedef struct usbio_event {
+  uint8_t pin;
+  uint8_t edge;   /* USBIO_EDGE_RISING or USBIO_EDGE_FALLING (never CHANGE)   */
+  uint16_t seq;   /* per-pin edge counter after this edge; matches
+                   * usbio_event_count_t.count, and wraps with it             */
+  uint32_t t_ms;  /* millis() when poll() detected the edge                   */
+} usbio_event_t;
+USBIO_STATIC_ASSERT(sizeof(usbio_event_t) == 8, "usbio_event_t must be 8 bytes");
+
+/* One watched pin, as reported by EVENT_COUNTS. The counter is monotonic and
+ * survives a full event ring, so it is the reliable way to ask "how many
+ * presses happened", while EVENT_POP answers "when, exactly". */
+typedef struct usbio_event_count {
+  uint8_t pin;
+  uint8_t mode;   /* enum usbio_edge_mode currently armed for the pin         */
+  uint16_t count; /* accepted edges since the pin was configured; wraps       */
+} usbio_event_count_t;
+USBIO_STATIC_ASSERT(sizeof(usbio_event_count_t) == 4, "usbio_event_count_t must be 4 bytes");
 
 typedef struct usbio_stream_status {
   uint8_t status;      /* always OK on a streaming build                      */
@@ -359,6 +466,25 @@ USBIO_STATIC_ASSERT(sizeof(usbio_stream_header_t) == 12, "usbio_stream_header_t 
  * A stream keeps running while control requests are served; changing the mode
  * of a selected pin (PIN_MODE) or RESET stops it. Unplugging or a USB suspend
  * stops it too: the selection and counters do not survive a re-enumeration.
+ *
+ * Event requests (all STALL UNSUPPORTED when USBIO_FLAG_EVENTS is clear):
+ *
+ *  CONFIG     pin < n_pins (else BAD_PIN), the pin carries USBIO_CAP_DIO and
+ *             its intended mode is INPUT* (else BAD_MODE), the low byte of
+ *             wValue is < USBIO_EDGE_COUNT (else BAD_VALUE). Arming a pin that
+ *             is not yet watched when event_max_pins are already watched ->
+ *             BAD_VALUE. USBIO_EDGE_OFF unwatches the pin, clears its counter
+ *             and discards its queued events; re-arming a watched pin replaces
+ *             its mode and debounce and resets its counter.
+ *  POP        never STALLs on an events build; returns min(wIndex or
+ *             USBIO_MAX_EVENTS_PER_POP, queued) events, oldest first, and
+ *             removes exactly those from the queue.
+ *  COUNTS     never STALLs on an events build; entries appear in the order the
+ *             pins were armed.
+ *
+ * RESET unwatches every pin and clears the queue. A PIN_MODE that takes a
+ * watched pin out of an INPUT* mode unwatches it (its queued events remain
+ * readable). Watches do not survive a re-enumeration.
  */
 
 #ifdef __cplusplus
