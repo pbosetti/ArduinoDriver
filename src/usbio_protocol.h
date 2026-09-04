@@ -469,12 +469,19 @@ USBIO_STATIC_ASSERT(sizeof(usbio_stream_header_t) == 12, "usbio_stream_header_t 
  *
  * Event requests (all STALL UNSUPPORTED when USBIO_FLAG_EVENTS is clear):
  *
- *  CONFIG     pin < n_pins (else BAD_PIN), the pin carries USBIO_CAP_DIO and
- *             its intended mode is INPUT* (else BAD_MODE), the low byte of
- *             wValue is < USBIO_EDGE_COUNT (else BAD_VALUE). Arming a pin that
- *             is not yet watched when event_max_pins are already watched ->
- *             BAD_VALUE. USBIO_EDGE_OFF unwatches the pin, clears its counter
- *             and discards its queued events; re-arming a watched pin replaces
+ *  CONFIG     pin < n_pins (else BAD_PIN). USBIO_EDGE_OFF is then ALWAYS
+ *             accepted: it unwatches the pin, clears its counter and discards
+ *             its queued events, and is a no-op on a pin that was not watched.
+ *             Unwatching deliberately skips the mode check below, so "stop
+ *             watching this pin" always succeeds - including from a teardown
+ *             path that has already moved the pin to another mode (which
+ *             unwatches it anyway, see the paragraph after this list), where
+ *             failing would be both surprising and useless.
+ *             For every other edge mode the pin must carry USBIO_CAP_DIO and
+ *             its intended mode must be INPUT* (else BAD_MODE), the low byte
+ *             of wValue must be < USBIO_EDGE_COUNT (else BAD_VALUE), and
+ *             arming a pin that is not yet watched when event_max_pins are
+ *             already watched -> BAD_VALUE. Re-arming a watched pin replaces
  *             its mode and debounce and resets its counter.
  *  POP        never STALLs on an events build; returns min(wIndex or
  *             USBIO_MAX_EVENTS_PER_POP, queued) events, oldest first, and

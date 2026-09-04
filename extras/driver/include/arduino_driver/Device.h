@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -35,6 +36,33 @@ struct DeviceOptions {
   std::chrono::milliseconds ready_delay{50};
 };
 
+/// Device::read_time() result: the device's raw millis()/micros() at reply
+/// time, the reconstructed 64-bit microsecond clock (see
+/// reconstruct_micros64() in Protocol.h), and a host-time anchor.
+///
+/// The anchor lets the host place device time on its own timeline: host_time
+/// is the midpoint of a host steady_clock interval bracketing the GET_TIME
+/// control transfer (read immediately before and after it), and round_trip
+/// is that interval's length. The device's clock at host_time is micros64
+/// microseconds since boot, with an uncertainty bounded by round_trip / 2
+/// (the classic NTP one-way-delay assumption: the transfer takes about as
+/// long in each direction). For a control transfer this is typically a
+/// fraction of a millisecond to a couple of milliseconds; it degrades under
+/// system load, a USB hub, or a busy device queue, so treat round_trip
+/// itself as the authoritative accuracy figure for a given reading rather
+/// than the "typical" number in this comment.
+struct DeviceTime {
+  std::uint32_t millis{0};
+  std::uint32_t micros{0};
+  std::uint64_t micros64{0}; ///< reconstructed from millis + micros; valid
+                             ///< for ~49.7 days from device boot
+  std::chrono::steady_clock::time_point host_time{}; ///< midpoint of the
+      ///< round trip: the host's best estimate of "now" on its own clock, at
+      ///< the moment the device's clock read micros64
+  std::chrono::microseconds round_trip{0}; ///< length of the round trip;
+      ///< host_time's uncertainty is +/- round_trip / 2
+};
+
 /// One UsbIo device behind a Transport.
 ///
 /// Construction issues GET_INFO (magic and protocol version are verified;
@@ -49,8 +77,47 @@ struct DeviceOptions {
 /// IN replies reporting BUSY are retried (Options::busy_max_attempts,
 /// Options::busy_delay) and DeviceBusy is thrown when the retries run out.
 ///
-/// Device is NOT thread-safe: use one instance per thread or serialise the
-/// calls externally.
+/// ---- Threading contract ----------------------------------------------
+///
+/// Every Device method that touches the transport funnels through send_out()
+/// / raw_in() (read_in() and the streaming/event helpers call those too), and
+/// each of those two methods holds a private mutex for the duration of its
+/// one control transfer. That makes individual control transfers safe to
+/// issue concurrently from multiple threads: they are simply serialised at
+/// the wire, one at a time, in whatever order they arrive. This is what lets
+/// an EventWatcher's worker thread poll EVENT_POP on a background thread
+/// while the owning thread keeps calling ordinary methods (digital_write(),
+/// analog_read(), ...) without either side needing to know about the other.
+///
+/// That mutex is deliberately narrower than the pre-existing Stream gate:
+/// starting a Stream (start_stream()) still marks the Device "busy" and every
+/// *other* method (the ordinary I/O above, plus configure_event() /
+/// poll_events() / event_counts() / wait_event() / read_time()) still throws
+/// DeviceBusy for as long as it runs, exactly as before -- see Stream.h.
+/// EventWatcher gets no equivalent gate: it is just a convenience wrapper
+/// around the public, already-thread-safe event methods, so it never locks
+/// the caller out. Running more than one EventWatcher (or otherwise driving
+/// configure_event() concurrently) over overlapping pins is not guarded
+/// against -- the watch-set bookkeeping is entirely on the device, so the
+/// last EVENT_CONFIG for a given pin simply wins, same as calling pin_mode()
+/// on the same pin from two threads would.
+///
+/// Lock ordering: the streaming path's internal mutex (StreamState::mutex,
+/// guarding poll_stream_status() / end_stream() / start_stream() against each
+/// other) is always acquired *before* the control-transfer mutex, never
+/// after, because those three methods take it and then call send_out() /
+/// raw_in() from inside that critical section. No code path does the
+/// opposite (acquire the control-transfer mutex and then reach for
+/// StreamState::mutex), so the two never deadlock against each other.
+///
+/// What is still NOT safe: moving or destroying a Device while a Stream or
+/// EventWatcher created from it is still alive (both are references into the
+/// Device, like an iterator into its container -- see Stream.h), or blocking
+/// an EventWatcher callback on stop()/the destructor of its own EventWatcher
+/// (that joins the thread the callback is running on: same deadlock a Stream
+/// callback would have). Barring that, ordinary methods and the event
+/// methods may be called freely from any thread, at any time, without
+/// external synchronisation.
 class Device {
 public:
   using Options = DeviceOptions;
@@ -162,6 +229,51 @@ public:
   /// as the returned Stream runs (or is not destroyed / stopped).
   Stream start_stream(StreamConfig config);
 
+  // ---- Device time ------------------------------------------------------
+
+  /// GET_TIME plus a host-time anchor: see DeviceTime for what the result
+  /// means and how accurate it is. Throws DeviceBusy while a Stream is
+  /// running (see the threading contract above).
+  DeviceTime read_time();
+
+  // ---- Pin events (only when info().events() is true) -----------------------
+
+  /// EVENT_CONFIG. EdgeMode::Off unwatches the pin (clears its counter and
+  /// discards its queued events); arming an already-watched pin replaces its
+  /// edge mode and debounce and resets its counter. Throws NotSupported when
+  /// info().events() is false; InvalidPin for pin >= pin_count(); InvalidMode
+  /// when the pin lacks digital I/O or is not in an INPUT* mode (the device
+  /// STALLs EVENT_CONFIG with BAD_MODE); InvalidValue for an unknown edge
+  /// mode, for debounce > MaxDebounceMs, or when arming a pin that is not yet
+  /// watched would exceed info().event_max_pins (the device STALLs
+  /// EVENT_CONFIG with BAD_VALUE either way); DeviceBusy while a Stream is
+  /// running.
+  void configure_event(std::uint8_t pin, EdgeMode edge,
+                       std::chrono::milliseconds debounce = {});
+  /// Drains every event currently queued: one or more EVENT_POP calls,
+  /// looping while the reply's `pending` is set, oldest edge first. When
+  /// `dropped` is not null, it receives the total events the device-side
+  /// ring had to drop since the previous poll_events() / wait_event() call
+  /// (saturating at 255); the per-pin counters in event_counts() stay exact
+  /// regardless of drops -- see usbio_protocol.h "Pin events". Throws
+  /// NotSupported when info().events() is false; DeviceBusy while a Stream is
+  /// running.
+  std::vector<PinEvent> poll_events(std::uint8_t *dropped = nullptr);
+  /// EVENT_COUNTS: the accepted-edge counter of every currently watched pin,
+  /// in the order the pins were armed. Throws NotSupported when
+  /// info().events() is false; DeviceBusy while a Stream is running.
+  std::vector<EventCount> event_counts();
+  /// Polls for a single event every `poll_interval` until one arrives or
+  /// `timeout` elapses; returns nullopt on timeout. Unlike poll_events(),
+  /// this never pops more than one event per device round trip, so an event
+  /// that arrives during the wait but is not the first one taken stays
+  /// queued on the device for the next wait_event() / poll_events() call --
+  /// nothing found this way is ever lost. Throws NotSupported when
+  /// info().events() is false; DeviceBusy while a Stream is running.
+  std::optional<PinEvent>
+  wait_event(std::chrono::milliseconds timeout,
+            std::chrono::milliseconds poll_interval = std::chrono::milliseconds{20});
+
 private:
   friend class Stream;
 
@@ -190,6 +302,17 @@ private:
   /// streaming flag. Called by Stream::stop() / its destructor; never
   /// throws, safe to call more than once.
   void end_stream() noexcept;
+  /// Throws NotSupported when info().events() is false; called at the top of
+  /// every event method (mirrors require_caps() for the capability flag).
+  void require_events(std::string_view what) const;
+  /// One EVENT_POP requesting at most `max_events` (0 = as many as the wire
+  /// reply holds, i.e. min(MaxEventsPerPop, queued)); decoded entries are
+  /// appended to `out`, oldest first. `dropped` / `pending`, when not null,
+  /// receive the reply header's fields. Building block for poll_events()
+  /// (loops with max_events = 0 while pending) and wait_event() (calls with
+  /// max_events = 1 so it never discards an event beyond the first).
+  void pop_events_once(std::uint16_t max_events, std::vector<PinEvent> &out,
+                       std::uint8_t *dropped, bool *pending);
 
   std::unique_ptr<Transport> _transport;
   Options _options;
@@ -207,6 +330,19 @@ private:
     std::vector<std::uint8_t> selected; ///< STREAM_SELECT bookkeeping
   };
   std::unique_ptr<StreamState> _stream{std::make_unique<StreamState>()};
+
+  /// Serialises individual control transfers -- send_out()'s and raw_in()'s
+  /// single control_out()/control_in() call each -- so Device methods can be
+  /// called concurrently from multiple threads (see the threading contract
+  /// above). Behind a pointer for the same reason StreamState is: a plain
+  /// std::mutex member would make Device non-movable. Kept as a distinct
+  /// mutex from StreamState::mutex (never the same object) so the two nest
+  /// predictably: StreamState::mutex is always acquired first, this one
+  /// second, never the other way around.
+  struct IoState {
+    std::mutex mutex;
+  };
+  std::unique_ptr<IoState> _io{std::make_unique<IoState>()};
 };
 
 } // namespace ArduinoDriver

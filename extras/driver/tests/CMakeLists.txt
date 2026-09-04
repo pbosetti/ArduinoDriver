@@ -21,6 +21,9 @@ add_executable(arduino_driver_tests
   test_enumeration.cpp
   test_stream_decoding.cpp
   test_stream_api.cpp
+  test_time.cpp
+  test_events_api.cpp
+  test_event_watcher.cpp
   test_hardware.cpp # [.hardware]: hidden unless selected explicitly
 )
 arduinodriver_configure_target(arduino_driver_tests)

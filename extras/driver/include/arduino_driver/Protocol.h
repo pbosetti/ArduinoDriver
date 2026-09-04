@@ -36,6 +36,10 @@ enum class Request : std::uint8_t {
   StreamStart = USBIO_REQ_STREAM_START,
   StreamStop = USBIO_REQ_STREAM_STOP,
   StreamStatus = USBIO_REQ_STREAM_STATUS,
+  GetTime = USBIO_REQ_GET_TIME,
+  EventConfig = USBIO_REQ_EVENT_CONFIG,
+  EventPop = USBIO_REQ_EVENT_POP,
+  EventCounts = USBIO_REQ_EVENT_COUNTS,
   Reset = USBIO_REQ_RESET,
 };
 
@@ -62,6 +66,16 @@ enum class PinMode : std::uint8_t {
   Dac = USBIO_MODE_DAC,
 };
 inline constexpr std::uint8_t PinModeCount = USBIO_MODE_COUNT;
+
+/// Low byte of EVENT_CONFIG's wValue: which edges are reported for a pin.
+/// Off removes the pin from the watch set.
+enum class EdgeMode : std::uint8_t {
+  Off = USBIO_EDGE_OFF,
+  Rising = USBIO_EDGE_RISING,
+  Falling = USBIO_EDGE_FALLING,
+  Change = USBIO_EDGE_CHANGE,
+};
+inline constexpr std::uint8_t EdgeModeCount = USBIO_EDGE_COUNT;
 
 /// Board identifier reported by GET_INFO (high byte = architecture family).
 enum class BoardId : std::uint16_t {
@@ -95,6 +109,10 @@ inline constexpr std::size_t AllHeaderLen = sizeof(usbio_all_header_t); // 2
 inline constexpr std::size_t StatusReplyLen = sizeof(usbio_status_reply_t); // 4
 inline constexpr std::size_t StreamStatusLen = sizeof(usbio_stream_status_t); // 16
 inline constexpr std::size_t StreamHeaderLen = sizeof(usbio_stream_header_t);  // 12
+inline constexpr std::size_t TimeReplyLen = sizeof(usbio_time_reply_t);       // 12
+inline constexpr std::size_t EventHeaderLen = sizeof(usbio_event_header_t);   // 4
+inline constexpr std::size_t EventLen = sizeof(usbio_event_t);               // 8
+inline constexpr std::size_t EventCountLen = sizeof(usbio_event_count_t);    // 4
 
 inline constexpr std::size_t MaxPins = USBIO_MAX_PINS;
 inline constexpr std::size_t MaxAin = USBIO_MAX_AIN;
@@ -106,6 +124,12 @@ inline constexpr std::uint16_t StreamMagic = USBIO_STREAM_MAGIC;
 inline constexpr std::size_t StreamEpSize = USBIO_STREAM_EP_SIZE;
 inline constexpr std::size_t MaxStreamChannels = USBIO_MAX_STREAM_CHANNELS;
 inline constexpr std::uint16_t StreamMinPeriodUs = USBIO_STREAM_MIN_PERIOD_US;
+
+/// Pin event limits (see usbio_protocol.h "Pin events").
+inline constexpr std::size_t MaxEventPins = USBIO_MAX_EVENT_PINS;
+inline constexpr std::size_t EventQueueDepth = USBIO_EVENT_QUEUE_DEPTH;
+inline constexpr std::size_t MaxEventsPerPop = USBIO_MAX_EVENTS_PER_POP;
+inline constexpr std::uint8_t MaxDebounceMs = USBIO_MAX_DEBOUNCE_MS;
 
 /// Byte offsets inside the GET_INFO reply (usbio_info_t, packed by natural
 /// alignment: every uint16_t sits at an even offset).
@@ -123,8 +147,44 @@ inline constexpr std::size_t VrefMv = 14;
 inline constexpr std::size_t IoMv = 16;
 inline constexpr std::size_t Flags = 18;
 inline constexpr std::size_t StreamMaxChannels = 20;
-inline constexpr std::size_t Reserved = 21;
+inline constexpr std::size_t EventMaxPins = 21;
+inline constexpr std::size_t Reserved = 22;
 } // namespace InfoOffset
+
+/// Byte offsets inside usbio_time_reply_t (GET_TIME reply).
+namespace TimeReplyOffset {
+inline constexpr std::size_t Status = 0;
+inline constexpr std::size_t Reserved = 1;
+inline constexpr std::size_t Reserved2 = 2;
+inline constexpr std::size_t Millis = 4;
+inline constexpr std::size_t Micros = 8;
+} // namespace TimeReplyOffset
+
+/// Byte offsets inside usbio_event_header_t (the header of EVENT_POP and
+/// EVENT_COUNTS replies; the array of usbio_event_t / usbio_event_count_t
+/// entries follows at EventHeaderLen).
+namespace EventHeaderOffset {
+inline constexpr std::size_t Status = 0;
+inline constexpr std::size_t Count = 1;
+inline constexpr std::size_t Dropped = 2;
+inline constexpr std::size_t Pending = 3;
+} // namespace EventHeaderOffset
+
+/// Byte offsets of one usbio_event_t entry, relative to that entry's start.
+namespace EventOffset {
+inline constexpr std::size_t Pin = 0;
+inline constexpr std::size_t Edge = 1;
+inline constexpr std::size_t Seq = 2;
+inline constexpr std::size_t TMs = 4;
+} // namespace EventOffset
+
+/// Byte offsets of one usbio_event_count_t entry, relative to that entry's
+/// start.
+namespace EventCountOffset {
+inline constexpr std::size_t Pin = 0;
+inline constexpr std::size_t Mode = 1;
+inline constexpr std::size_t Count = 2;
+} // namespace EventCountOffset
 
 /// Byte offsets inside usbio_stream_status_t (GET_STREAM_STATUS reply).
 namespace StreamStatusOffset {
@@ -175,6 +235,22 @@ constexpr std::size_t stream_record_len(std::size_t n_samples, bool digital,
   }
   return len;
 }
+/// Total EVENT_POP reply length (header + `count` usbio_event_t entries).
+constexpr std::size_t event_pop_len(std::size_t count) noexcept {
+  return EventHeaderLen + EventLen * count;
+}
+/// Total EVENT_COUNTS reply length (header + `count` usbio_event_count_t
+/// entries).
+constexpr std::size_t event_counts_len(std::size_t count) noexcept {
+  return EventHeaderLen + EventCountLen * count;
+}
+/// wValue of EVENT_CONFIG: debounce in the high byte, edge mode in the low.
+constexpr std::uint16_t encode_event_config_value(std::uint8_t debounce_ms,
+                                                   EdgeMode edge) noexcept {
+  return static_cast<std::uint16_t>(
+      (static_cast<std::uint16_t>(debounce_ms) << 8) |
+      static_cast<std::uint8_t>(edge));
+}
 /// Largest value representable with `bits` bits (0 for bits == 0, capped at
 /// 16 bits, the width of wValue and of the ADC samples).
 constexpr std::uint16_t max_value(unsigned bits) noexcept {
@@ -199,6 +275,7 @@ constexpr bool is_out(Request request) noexcept {
   case Request::StreamSelect:
   case Request::StreamStart:
   case Request::StreamStop:
+  case Request::EventConfig:
   case Request::Reset:
     return true;
   case Request::GetInfo:
@@ -209,6 +286,9 @@ constexpr bool is_out(Request request) noexcept {
   case Request::AiReadAll:
   case Request::GetStatus:
   case Request::StreamStatus:
+  case Request::GetTime:
+  case Request::EventPop:
+  case Request::EventCounts:
     return false;
   }
   return false;
@@ -332,6 +412,8 @@ struct Info {
   std::uint16_t flags{0};      ///< USBIO_FLAG_* bits
   std::uint8_t stream_max_channels{0}; ///< pins STREAM_SELECT accepts at
                                        ///< once; 0 when streaming() is false
+  std::uint8_t event_max_pins{0};     ///< pins EVENT_CONFIG watches at once;
+                                       ///< 0 when events() is false
 
   constexpr bool has_vendor_interface() const noexcept {
     return (flags & USBIO_FLAG_VENDOR_INTERFACE) != 0;
@@ -343,6 +425,10 @@ struct Info {
   /// True when the board exposes the bulk IN endpoint and STREAM_* requests.
   constexpr bool streaming() const noexcept {
     return (flags & USBIO_FLAG_STREAMING) != 0;
+  }
+  /// True when the board exposes the EVENT_* requests.
+  constexpr bool events() const noexcept {
+    return (flags & USBIO_FLAG_EVENTS) != 0;
   }
 };
 
@@ -414,6 +500,7 @@ inline Info decode_info(std::span<const std::byte> bytes) {
   info.io_mv = read_u16le(bytes, InfoOffset::IoMv);
   info.flags = read_u16le(bytes, InfoOffset::Flags);
   info.stream_max_channels = read_u8(bytes, InfoOffset::StreamMaxChannels);
+  info.event_max_pins = read_u8(bytes, InfoOffset::EventMaxPins);
   return info;
 }
 
@@ -483,6 +570,139 @@ constexpr void encode_stream_header(std::span<std::byte> bytes,
   write_u32le(bytes, StreamHeaderOffset::TUs, header.t_us);
 }
 
+// ---- Device time --------------------------------------------------------
+
+/// Decoded usbio_time_reply_t (GET_TIME reply).
+struct TimeReply {
+  Status status{Status::Ok};
+  std::uint32_t millis{0};
+  std::uint32_t micros{0};
+};
+
+/// Decodes a GET_TIME reply. Throws ProtocolError when the buffer is shorter
+/// than TimeReplyLen.
+inline TimeReply decode_time_reply(std::span<const std::byte> bytes) {
+  if (bytes.size() < TimeReplyLen) {
+    throw ProtocolError("GET_TIME reply is too short: " +
+                        std::to_string(bytes.size()) + " of " +
+                        std::to_string(TimeReplyLen) + " bytes");
+  }
+  TimeReply t;
+  t.status = static_cast<Status>(read_u8(bytes, TimeReplyOffset::Status));
+  t.millis = read_u32le(bytes, TimeReplyOffset::Millis);
+  t.micros = read_u32le(bytes, TimeReplyOffset::Micros);
+  return t;
+}
+
+/// Rebuilds a 64-bit microsecond clock from one GET_TIME reply's millis()
+/// and micros() (see usbio_protocol.h's GET_TIME comment): micros() wraps
+/// every ~71.6 minutes but millis() every ~49.7 days, and the two agree
+/// modulo 2^32 (micros == millis * 1000 mod 2^32), so millis() pins down
+/// which ~71.6-minute wrap of micros() the reply belongs to.
+///
+/// Algorithm: `millis * 1000` (widened to 64 bits, no overflow risk since
+/// millis is 32 bits) is within 1000 us of the true elapsed time -- that is
+/// the size of the truncation `millis()` itself performs. Rounding that
+/// estimate down to the nearest multiple of 2^32 and adding the exact
+/// `micros` reading reconstructs the true value, except right at a 2^32
+/// boundary, where the sub-1000us estimation error can place the naive
+/// result one whole wrap away from the truth; the two branches below detect
+/// that (the naive result would differ from the millis-based estimate by
+/// nearly a full wrap, not by a small truncation error) and correct it.
+///
+/// Valid for ~49.7 days after the device booted, i.e. until millis() itself
+/// wraps -- exactly the range GET_TIME's own documentation promises. Past
+/// that, or if millis and micros were not read from the same GET_TIME reply,
+/// the result is silently wrong: there is no way to detect it from these two
+/// values alone.
+constexpr std::uint64_t reconstruct_micros64(std::uint32_t millis_value,
+                                             std::uint32_t micros_value) noexcept {
+  constexpr std::uint64_t Wrap = std::uint64_t{1} << 32; // micros()'s period
+  const std::uint64_t coarse = static_cast<std::uint64_t>(millis_value) * 1000ull;
+  const std::uint64_t base = (coarse / Wrap) * Wrap; // coarse, epoch-aligned
+  std::uint64_t candidate = base + micros_value;
+  if (candidate > coarse && candidate - coarse > Wrap / 2) {
+    candidate -= Wrap;
+  } else if (coarse > candidate && coarse - candidate > Wrap / 2) {
+    candidate += Wrap;
+  }
+  return candidate;
+}
+
+// ---- Pin events -----------------------------------------------------------
+
+/// Decoded header of an EVENT_POP / EVENT_COUNTS reply (usbio_event_header_t);
+/// the array of entries follows at EventHeaderLen.
+struct EventHeader {
+  Status status{Status::Ok};
+  std::uint8_t count{0};
+  std::uint8_t dropped{0}; ///< EVENT_POP only; 0 in an EVENT_COUNTS reply
+  std::uint8_t pending{0}; ///< EVENT_POP only; 0 in an EVENT_COUNTS reply
+};
+
+/// Decodes the 4-byte header shared by EVENT_POP and EVENT_COUNTS replies.
+/// Throws ProtocolError when the buffer is shorter than EventHeaderLen.
+inline EventHeader decode_event_header(std::span<const std::byte> bytes) {
+  if (bytes.size() < EventHeaderLen) {
+    throw ProtocolError("EVENT_POP/EVENT_COUNTS reply is too short: " +
+                        std::to_string(bytes.size()) + " of " +
+                        std::to_string(EventHeaderLen) + " bytes");
+  }
+  EventHeader h;
+  h.status = static_cast<Status>(read_u8(bytes, EventHeaderOffset::Status));
+  h.count = read_u8(bytes, EventHeaderOffset::Count);
+  h.dropped = read_u8(bytes, EventHeaderOffset::Dropped);
+  h.pending = read_u8(bytes, EventHeaderOffset::Pending);
+  return h;
+}
+
+/// One decoded pin edge (usbio_event_t), as EVENT_POP reports it. `edge` is
+/// Rising or Falling (never Change: the device only ever reports the edge it
+/// actually saw).
+struct PinEvent {
+  std::uint8_t pin{0};
+  EdgeMode edge{EdgeMode::Off};
+  std::uint16_t seq{0};  ///< per-pin edge counter after this edge; matches
+                         ///< EventCount::count, and wraps with it
+  std::uint32_t t_ms{0}; ///< device millis() when poll() detected the edge
+};
+
+/// Decodes the usbio_event_t at index `index` of an EVENT_POP reply (i.e. at
+/// byte offset `EventHeaderLen + index * EventLen`). Caller guarantees the
+/// span reaches that far.
+constexpr PinEvent decode_event(std::span<const std::byte> bytes,
+                                std::size_t index) noexcept {
+  const std::size_t base = EventHeaderLen + EventLen * index;
+  PinEvent e;
+  e.pin = read_u8(bytes, base + EventOffset::Pin);
+  e.edge = static_cast<EdgeMode>(read_u8(bytes, base + EventOffset::Edge));
+  e.seq = read_u16le(bytes, base + EventOffset::Seq);
+  e.t_ms = read_u32le(bytes, base + EventOffset::TMs);
+  return e;
+}
+
+/// One watched pin's counter (usbio_event_count_t), as EVENT_COUNTS reports
+/// it.
+struct EventCount {
+  std::uint8_t pin{0};
+  EdgeMode mode{EdgeMode::Off}; ///< edge mode currently armed for the pin
+  std::uint16_t count{0};       ///< accepted edges since the pin was
+                                ///< configured; wraps
+};
+
+/// Decodes the usbio_event_count_t at index `index` of an EVENT_COUNTS reply
+/// (i.e. at byte offset `EventHeaderLen + index * EventCountLen`). Caller
+/// guarantees the span reaches that far.
+constexpr EventCount decode_event_count(std::span<const std::byte> bytes,
+                                        std::size_t index) noexcept {
+  const std::size_t base = EventHeaderLen + EventCountLen * index;
+  EventCount c;
+  c.pin = read_u8(bytes, base + EventCountOffset::Pin);
+  c.mode = static_cast<EdgeMode>(read_u8(bytes, base + EventCountOffset::Mode));
+  c.count = read_u16le(bytes, base + EventCountOffset::Count);
+  return c;
+}
+
 // ---- Names ------------------------------------------------------------------
 
 /// Protocol name of a request, e.g. "DIO_WRITE".
@@ -518,6 +738,14 @@ constexpr std::string_view to_string(Request request) noexcept {
     return "STREAM_STOP";
   case Request::StreamStatus:
     return "GET_STREAM_STATUS";
+  case Request::GetTime:
+    return "GET_TIME";
+  case Request::EventConfig:
+    return "EVENT_CONFIG";
+  case Request::EventPop:
+    return "EVENT_POP";
+  case Request::EventCounts:
+    return "EVENT_COUNTS";
   case Request::Reset:
     return "RESET";
   }
@@ -587,6 +815,21 @@ constexpr std::string_view to_string(PinMode mode) noexcept {
     return "PWM";
   case PinMode::Dac:
     return "DAC";
+  }
+  return "UNKNOWN";
+}
+
+/// Protocol name of an edge mode, e.g. "FALLING".
+constexpr std::string_view to_string(EdgeMode mode) noexcept {
+  switch (mode) {
+  case EdgeMode::Off:
+    return "OFF";
+  case EdgeMode::Rising:
+    return "RISING";
+  case EdgeMode::Falling:
+    return "FALLING";
+  case EdgeMode::Change:
+    return "CHANGE";
   }
   return "UNKNOWN";
 }

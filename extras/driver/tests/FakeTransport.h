@@ -46,6 +46,10 @@ struct FakeBoard {
   /// with USBIO_FLAG_STREAMING too, e.g. `board.flags |=
   /// USBIO_FLAG_STREAMING; board.stream_max_channels = 4;`).
   std::uint8_t stream_max_channels{0};
+  /// usbio_info_t.event_max_pins; 0 unless a test opts in (set flags with
+  /// USBIO_FLAG_EVENTS too, e.g. `board.flags |= USBIO_FLAG_EVENTS;
+  /// board.event_max_pins = 4;`).
+  std::uint8_t event_max_pins{0};
 
   std::uint8_t n_pins() const noexcept;
   /// Pins carrying PinCaps::Ain, ascending.
@@ -156,6 +160,39 @@ public:
   /// (guarded: safe to call while a Stream's worker thread is running).
   void set_stream_overruns(std::uint32_t n) noexcept;
 
+  // ---- Device clock (millis()/micros()), and pin events ----------------------
+  // GET_TIME serves these two counters directly. They also drive the events
+  // model below: set_digital() compares the new level against the shadow it
+  // replaces and, for a watched pin, runs it through debounce and the
+  // bounded event queue exactly as poll() is documented to in
+  // usbio_protocol.h -- i.e. set_digital() IS this fake's "poll() detected a
+  // level change" moment. Guarded (see "Bulk streaming model" below): an
+  // EventWatcher's worker thread reaches GET_TIME/EVENT_* on this same path
+  // while the test thread calls set_digital() / advance_millis() /
+  // set_millis() / configure_event()-via-Device from another thread.
+
+  /// Sets millis() (does not touch micros()); lets a test build a deliberately
+  /// inconsistent millis()/micros() pair, e.g. to exercise GET_TIME decoding
+  /// right at a wrap boundary.
+  void set_millis(std::uint32_t ms) noexcept;
+  /// Sets micros() (does not touch millis()); see set_millis().
+  void set_micros(std::uint32_t us) noexcept;
+  /// Advances both counters together, the way real firmware ticks would
+  /// (each wraps on uint32_t overflow, exactly like the device).
+  void advance_millis(std::uint32_t delta_ms) noexcept;
+  std::uint32_t fake_millis() const noexcept;
+  std::uint32_t fake_micros() const noexcept;
+
+  /// Pins currently watched (EVENT_CONFIG-armed), in arm order -- mirrors
+  /// what EVENT_COUNTS would report.
+  std::vector<std::uint8_t> watched_event_pins() const;
+  /// Events queued and not yet drained by EVENT_POP (guarded snapshot).
+  std::size_t event_queue_size() const noexcept;
+  /// The saturating drop counter the next EVENT_POP will report (guarded
+  /// snapshot; EVENT_POP resets it to 0 as it reports it, exactly like the
+  /// real header field).
+  std::uint8_t pending_event_drops() const noexcept;
+
   // ---- Bulk streaming model ---------------------------------------------------
   // The bulk queue is a flat byte buffer bulk_in() drains from; tests build it
   // with the helpers below to exercise framing, straddling, resync and drop
@@ -223,6 +260,39 @@ private:
   void check_pin(std::uint8_t pin) const;
   void handle_stream_select(std::uint16_t value, std::uint16_t index);
   void handle_stream_start(std::uint16_t value, std::uint16_t index);
+  /// EVENT_CONFIG's device-side logic (pin/mode/value/capacity order per
+  /// usbio_protocol.h "Event requests"). Caller (control_out()) has already
+  /// checked USBIO_FLAG_EVENTS.
+  void handle_event_config(std::uint16_t value, std::uint16_t index);
+  /// Removes `pin` from the watch set, if watched (a no-op otherwise). When
+  /// `purge_queue` is set (EVENT_CONFIG's EdgeMode::Off), already-queued
+  /// events for that pin are discarded too; otherwise (a PIN_MODE that takes
+  /// a watched pin out of an INPUT* mode) they are left for EVENT_POP, per
+  /// usbio_protocol.h. Caller holds _mutex.
+  void unwatch_event_locked(std::uint8_t pin, bool purge_queue);
+  /// set_digital()'s edge-detection step: compares `new_level` against the
+  /// pin's current shadow value and, for a watched pin whose armed edge mode
+  /// wants that transition, runs debounce, bumps the per-pin counter and
+  /// tries to enqueue the event (dropping the newest on a full ring). A
+  /// no-op for an unwatched pin or a non-edge (level unchanged). Caller holds
+  /// _mutex.
+  void handle_edge_locked(std::uint8_t pin, bool new_level);
+
+  /// One watched pin, as the device-side model tracks it.
+  struct EventWatch {
+    std::uint8_t pin;
+    EdgeMode edge;
+    std::uint8_t debounce_ms;
+    std::uint16_t count{0};
+    std::optional<std::uint32_t> last_accept_ms;
+  };
+  /// One queued edge, as EVENT_POP will report it.
+  struct QueuedEvent {
+    std::uint8_t pin;
+    EdgeMode edge;
+    std::uint16_t seq;
+    std::uint32_t t_ms;
+  };
 
   FakeBoard _board;
   std::vector<std::optional<PinMode>> _mode;
@@ -249,12 +319,19 @@ private:
   std::uint32_t _stream_seq{0};
   std::uint32_t _stream_overruns{0};
 
-  // Bulk model. _mutex guards exactly the state a Stream's worker
-  // thread touches concurrently with the test thread: the byte queue and
-  // the two counters GET_STREAM_STATUS reports (seq, overruns). The ramp
-  // parameters are only ever touched from the test thread (queue_stream_
-  // records() is what turns them into queue bytes) and need no locking.
+  // Bulk model, device clock and pin events. _mutex guards exactly the state
+  // a Stream's worker thread or an EventWatcher's worker thread touches
+  // concurrently with the test thread: the bulk byte queue, the two counters
+  // GET_STREAM_STATUS reports (seq, overruns), the millis()/micros() clock,
+  // and the events watch set / queue / drop counter. The ramp parameters are
+  // only ever touched from the test thread (queue_stream_records() is what
+  // turns them into queue bytes) and need no locking.
   mutable std::mutex _mutex;
+  std::uint32_t _millis{0};
+  std::uint32_t _micros{0};
+  std::vector<EventWatch> _event_watch;   ///< arm order == EVENT_COUNTS order
+  std::deque<QueuedEvent> _event_queue;   ///< bounded at EventQueueDepth
+  std::uint8_t _event_dropped{0};         ///< saturating; cleared by EVENT_POP
   std::deque<std::byte> _bulk_queue;
   std::deque<std::size_t> _bulk_chunks;
   std::uint16_t _ramp_start{0};

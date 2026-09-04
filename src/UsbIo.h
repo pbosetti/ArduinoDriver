@@ -95,6 +95,40 @@ private:
 
   static const uint8_t ModeNone = 0xFF; /* pin never configured by the host */
 
+  /* Pin events (usbio_protocol.h, "Pin events"). Unlike streaming this needs
+   * no endpoint, so it is unconditional - every board gets it. */
+
+  static const uint8_t EventTombstone = 0xFFu; /* usbio_event_t.pin sentinel
+                                                 * for a ring slot discarded
+                                                 * by EVENT_CONFIG's OFF (see
+                                                 * discard_events_for_pin())  */
+
+  /* One watched pin. `arm_seq` is an ISR-only order stamp, bumped from a
+   * single free-running counter on every successful arm/re-arm; EVENT_COUNTS
+   * (also ISR-side) sorts by it to report "the order the pins were armed"
+   * without ever having to shift this array (which would race poll()).
+   * `count` is deliberately poll()-only: poll() notices arm_seq has moved
+   * (via `seen_seq`) and zeroes `count` itself, instead of the ISR resetting
+   * it directly - otherwise a re-arm landing mid-increment could silently
+   * undo poll()'s bump and violate "the per-pin counters keep counting"
+   * (usbio_protocol.h, "Pin events"). */
+  struct EventWatch {
+    uint8_t pin;                  /* ISR-owned; valid only while active     */
+    volatile uint8_t active;      /* ISR-owned; 0 free / 1 watched          */
+    volatile uint8_t edge_mode;   /* ISR-owned; enum usbio_edge_mode, != OFF
+                                   * while active                           */
+    volatile uint8_t debounce_ms; /* ISR-owned                              */
+    volatile uint8_t arm_seq;     /* ISR-owned order stamp, see above       */
+    uint8_t seen_seq;             /* poll()-only mirror of arm_seq          */
+    uint8_t prev_level;           /* poll()-only: last scanned digital level*/
+    uint32_t debounce_until;      /* poll()-only: millis() deadline; a scan
+                                   * before this time absorbs a matching
+                                   * edge without counting it ("first edge
+                                   * wins", usbio_protocol.h, "Pin events")  */
+    volatile uint16_t count;      /* poll()-owned edge counter; wraps, and
+                                   * matches usbio_event_t.seq / .count     */
+  };
+
 #if USBIO_HAS_STREAM_TRANSPORT
   /* Every record fits in one bulk packet: USBIO_MAX_STREAM_CHANNELS (8) and
    * USBIO_MAX_PINS (128, i.e. a 16-byte digital bitmap) bound header +
@@ -157,6 +191,28 @@ private:
   static uint8_t read_pin(uint8_t pin);
   static uint16_t read_analog(uint8_t pin);
 
+  /* ISR side: validate and apply EVENT_CONFIG. See usbio_protocol.h, "Event
+   * requests", for the exact rule each check enforces. */
+  bool handle_event_config(uint8_t pin, uint16_t wValue);
+  /* Index into _event_watch of `pin`'s slot, or -1 if it is not watched. */
+  int8_t event_watch_index(uint8_t pin) const;
+  /* Index of an inactive slot. Only called once capacity has been checked,
+   * so a free slot is guaranteed to exist. */
+  uint8_t find_free_event_slot() const;
+  /* Tombstones (usbio_protocol.h: OFF "discards its queued events") every
+   * already-queued ring entry for `pin`, in place - see EventTombstone. */
+  void discard_events_for_pin(uint8_t pin);
+  /* Real (non-tombstoned) entries between _event_tail and _event_head; the
+   * `pending` field of an EVENT_POP reply. */
+  uint8_t count_queued_events() const;
+
+  /* poll() side: edge detection, right after refresh_shadow() so it sees the
+   * same scan the shadow read did (usbio_protocol.h, "Pin events"). */
+  void event_poll();
+  /* Append one accepted edge to the ring, or drop it and saturate
+   * _event_dropped if the ring is full. */
+  void push_event(uint8_t pin, uint8_t edge, uint16_t seq, uint32_t now);
+
 #if USBIO_HAS_STREAM_TRANSPORT
   /* ISR side: validate and apply one STREAM_* OUT request. See
    * usbio_protocol.h, "OUT request validation", the "Streaming requests"
@@ -198,6 +254,19 @@ private:
   uint8_t _reset_done;              /* last value honoured by poll() */
   volatile uint8_t _last_error;
   uint8_t _ain_cursor;
+
+  /* Pin events. Watch table in EVENT_CONFIG order (see EventWatch above),
+   * plus the SPSC ring EVENT_POP drains - roles reversed from _queue: here
+   * poll() is the producer (event_poll()/push_event()) and the ISR
+   * (EVENT_POP) is the consumer, but the same free-running-index, single-
+   * writer-per-index discipline applies (UsbIo.cpp, enqueue()). */
+  EventWatch _event_watch[USBIO_MAX_EVENT_PINS];
+  uint8_t _event_n_watched;    /* ISR-only                                  */
+  uint8_t _event_arm_seq;      /* ISR-only free-running arm/re-arm counter  */
+  usbio_event_t _event_ring[USBIO_EVENT_QUEUE_DEPTH];
+  volatile uint8_t _event_head; /* poll()-only producer index               */
+  volatile uint8_t _event_tail; /* ISR-only consumer index (EVENT_POP)      */
+  volatile uint8_t _event_dropped; /* saturates at 255; reset by EVENT_POP  */
 
 #if USBIO_HAS_STREAM_TRANSPORT
   /* Selection set, in STREAM_SELECT order. Only mutated while the stream is

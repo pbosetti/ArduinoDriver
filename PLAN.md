@@ -345,3 +345,160 @@ Left open:
   the add/remove split. Harmless, but a reconfigured pin can then only be
   dropped by `RESET` or by restarting the selection.
 - No `[.hardware]` streaming test: the run above was manual.
+
+## Phase 3 — device time and pin events
+
+Contract frozen 2026-09-03 (`a77aa6a`), both halves implemented by sub-agents
+against it, same working split as phase 2 (firmware `src/**`, driver
+`extras/driver/**`).
+
+Two additions, deliberately both on plain control transfers so that every
+board is covered — the Renesas boards have no endpoint to stream over, and
+excluding them was not acceptable for this use case:
+
+- **`GET_TIME` (0x21)** returns `millis` and `micros` together, answered from
+  the setup callback rather than a `poll()` shadow so the values timestamp the
+  moment the request arrives. Sending both is what makes it useful: `micros`
+  wraps every ~71.6 min, but `micros == millis * 1000 (mod 2^32)`, so the host
+  rebuilds a 64-bit microsecond clock with no device-side bookkeeping, good for
+  49.7 days. That is the anchor the raw `t_us` of stream records and the `t_ms`
+  of pin events were missing; with a round-trip estimate the host can place
+  device timestamps on its own clock to about ±RTT/2.
+- **`EVENT_CONFIG` / `EVENT_POP` / `EVENT_COUNTS` (0x40–0x42)** report debounced
+  pin edges. Up to `USBIO_MAX_EVENT_PINS` pins are watched, each with an edge
+  mode and a 0–255 ms debounce window applied on the device ("first edge wins").
+
+Design decisions worth recording:
+
+- **Edges are detected by scanning, not by `attachInterrupt()`.** `poll()`
+  already refreshes the digital shadow every iteration, so comparing it against
+  the previous one costs almost nothing and avoids the whole hardware-interrupt
+  problem space: no IRQ-capable-pin restriction, no shared EXTI line conflicts
+  (STM32H7 and SAMD21 both multiplex pins onto shared interrupt lines), no
+  `InterruptIn` allocation from the mbed core, and no multi-producer ring — one
+  detection context instead of several ISRs racing each other. The cost is that
+  pulses shorter than one `loop()` iteration are missed, which is irrelevant for
+  buttons (the intended use) and disqualifying for encoders or tachometers.
+  The wire contract does not encode this choice, so a board could later detect
+  the same edges with a real interrupt without any host-visible change.
+- **Counters alongside the queue.** The event ring is bounded and can drop under
+  a flood; the per-pin counters cannot. So "how many presses happened" is always
+  answerable exactly, and only "when precisely did each one happen" degrades.
+- **Reply sizes are capped by SAMD, not by us**: that core's EP0 buffer limits a
+  reply to 64 bytes, so `EVENT_POP` returns at most 7 events (60 B) and
+  `EVENT_COUNTS` at most 8 pins (36 B).
+- **`Device` gains an internal mutex** around control transfers, so an
+  `EventWatcher`'s worker thread can poll for button events while the main
+  thread drives pins. The bulk `Stream` keeps its stricter `DeviceBusy` gate:
+  watching buttons must not lock out normal I/O, whereas streaming legitimately
+  owns the bulk path.
+
+### Status (2026-09-03)
+
+Both halves implemented, reviewed and building: 98 driver tests pass
+(warnings-as-errors, clean under ThreadSanitizer), all nine FQBNs compile
+warning-free, +1.2-1.4 kB flash and +392 B RAM on the firmware side.
+
+Hardware (Portenta H7): pin 5 in `INPUT_PULLDOWN`, watched with
+`arduino-io watch`, reports rising and falling edges as a wire is connected to
+and disconnected from 3V3, and `--debounce 100` cleanly suppresses the bounce
+of a hand-made contact. That exercises the whole path on real hardware -
+arming, the `poll()` scan, both edge directions, device-side debounce,
+`EVENT_POP` framing, and the host decode.
+
+Two bugs found in review, both fixed before the hardware run:
+
+- The event ring was cleared from `apply_reset()` (poll() context) by writing
+  `_event_head` from a snapshot of `_event_tail` - but the ISR owns
+  `_event_tail`, so an `EVENT_POP` landing between the read and the write left
+  tail one *ahead* of head, making `(uint8_t)(head - tail)` read as 255: a
+  permanently "full" ring that drops every later edge and never recovers. The
+  clear now happens in `request_reset()`, where the ISR moves `_event_tail` up
+  to a snapshot of `_event_head` - which can never overtake it.
+- The two sub-agents resolved the same ambiguity in the contract text in
+  *opposite* directions: the firmware validated the pin's mode before
+  unwatching (STALL `BAD_MODE`), while the driver's `FakeTransport` accepted
+  `EDGE_OFF` unconditionally. Both suites passed, yet a `configure_event(pin,
+  Off)` after a mode change would have thrown against real firmware and
+  succeeded in tests. Settled toward the permissive reading - unwatching now
+  always succeeds for a valid pin - and the contract now says so explicitly
+  instead of leaving it to inference. This also retires the equivalent wart
+  noted for `STREAM_SELECT` below, which is still unfixed and now inconsistent
+  with how events behave.
+
+Still unverified on hardware: `GET_TIME` (`arduino-io time`), the
+queue-overflow drop accounting, the 8-pin watch capacity, and `EventWatcher`'s
+callback mode. Note the CLI's `--debounce` defaults to 0; the scan itself only
+filters bounce shorter than one `loop()` iteration, so a real contact needs an
+explicit window (100 ms verified above).
+
+## Phase 4 — RPC into the sketch (design only, not implemented)
+
+Goal: let the host call a function the *sketch* registered, so a board can be
+extended with application-specific behaviour without touching the protocol.
+Request codes `0x50..0x5F` are already reserved for this in
+`usbio_protocol.h`; nothing else is implemented.
+
+This fits the existing architecture almost exactly: an RPC is the OUT-command
+pattern (validate in the ISR, execute in `poll()`) plus a payload and a result.
+
+```cpp
+// sketch
+uint8_t set_speed(const uint8_t *in, uint8_t in_len, uint8_t *out, uint8_t *out_len);
+void setup() { UsbIo.begin(); UsbIo.on(1, "set_speed", set_speed); }
+```
+
+```cpp
+// host
+std::vector<std::byte> result = dev.call(1, args, 200ms);
+```
+
+Handlers live in a fixed-size table (no heap), take and return raw bytes and
+return a status code. The optional name costs a little flash and buys
+`RPC_LIST` discovery, letting the driver resolve names to ids and validate a
+call before making it.
+
+### The hard part: getting arguments to the device
+
+The constraint that shaped the whole protocol is that **OUT requests have no
+data stage on any of the three stacks**, so a request carries 4 bytes at most,
+in `wValue`/`wIndex`. Two ways out:
+
+1. **Chunked staging (recommended).** `RPC_ARG` with `wIndex` = offset and
+   `wValue` = two payload bytes, repeated, then `RPC_CALL` with the handler id.
+   ~1 ms per 2 bytes, so a 16-byte argument costs ~8 ms. Portable to every
+   board with no new per-stack work, and adequate for the realistic cases
+   (a setpoint, a mode, a short config blob).
+2. **A real OUT data stage.** TinyUSB, SAMD's `USBDevice.recv()` and mbed's
+   read stage can all do it, but that is three separate implementations plus
+   hardware testing, to optimise a path that is rarely hot. Worth it only if
+   payloads beyond ~16 bytes become normal.
+
+Staging first; the data stage can be added later behind the same request codes
+if a payload need appears.
+
+### Constraints to design around
+
+- **Results are capped at ~56 bytes** by the SAMD core's 64-byte EP0 buffer,
+  not by `USBIO_MAX_REPLY_LEN`.
+- **The handler runs inside `poll()`**, so it must be short: it delays the
+  shadow refresh, the event scan and the stream sampler for as long as it runs.
+  This is the same rule as `loop()` itself, but it now applies to user code we
+  are inviting in, so it needs stating loudly in the docs.
+- **A handler must not call back into `UsbIo`** — re-entrancy would corrupt the
+  command queue.
+- **One call outstanding at a time** (a single result slot), with a call token
+  so a stale result cannot be mistaken for a fresh one. The host-side mutex
+  added in phase 3 serialises callers naturally.
+- Error surface to define: unknown handler id, arguments too long, result too
+  long, handler returned an error, result not ready yet, and a timeout that
+  distinguishes "still running" from "never started".
+
+### Sketch of the request block
+
+| bRequest | dir | wIndex | wValue | data |
+|---|---|---|---|---|
+| `0x50 RPC_LIST` | IN | first id | – | registered ids (+ names when given) |
+| `0x51 RPC_ARG` | OUT | byte offset | two argument bytes | – |
+| `0x52 RPC_CALL` | OUT | handler id | argument length | – |
+| `0x53 RPC_RESULT` | IN | – | – | status, token, result bytes |

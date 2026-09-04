@@ -24,6 +24,16 @@ USBIO_STATIC_ASSERT(USBIO_MAX_REPLY_LEN >=
 USBIO_STATIC_ASSERT(USBIO_MAX_REPLY_LEN >=
                         sizeof(usbio_all_header_t) + 2u * USBIO_MAX_AIN,
                     "reply buffer too small for AI_READ_ALL");
+USBIO_STATIC_ASSERT(USBIO_MAX_REPLY_LEN >= sizeof(usbio_event_header_t) +
+                                                USBIO_MAX_EVENTS_PER_POP *
+                                                    sizeof(usbio_event_t),
+                    "reply buffer too small for EVENT_POP");
+USBIO_STATIC_ASSERT(USBIO_MAX_REPLY_LEN >=
+                        sizeof(usbio_event_header_t) +
+                            USBIO_MAX_EVENT_PINS * sizeof(usbio_event_count_t),
+                    "reply buffer too small for EVENT_COUNTS");
+USBIO_STATIC_ASSERT((USBIO_EVENT_QUEUE_DEPTH & (USBIO_EVENT_QUEUE_DEPTH - 1u)) == 0,
+                    "event queue depth must be a power of two");
 /* The cores have a single analogWriteResolution() shared by PWM and DAC, so
  * DAC values are rescaled from dac_bits to pwm_bits before analogWrite(). */
 USBIO_STATIC_ASSERT(UsbIoBoard::DacBits <= UsbIoBoard::PwmBits,
@@ -34,6 +44,7 @@ UsbIoDevice UsbIo;
 namespace {
 
 const uint8_t QueueMask = (uint8_t)(USBIO_QUEUE_DEPTH - 1u);
+const uint8_t EventQueueMask = (uint8_t)(USBIO_EVENT_QUEUE_DEPTH - 1u);
 
 /* Producer fills a slot, then publishes it by bumping _head; the consumer
  * copies a slot, then releases it by bumping _tail. Both run on one core, so
@@ -55,7 +66,8 @@ inline void put_u16(uint8_t *dst, uint16_t v) {
 UsbIoDevice::UsbIoDevice()
     : _n_pins(0), _n_ain(0), _flags(0), _head(0), _tail(0), _epoch(0),
       _reset_requests(0), _reset_done(0), _last_error(USBIO_OK),
-      _ain_cursor(0)
+      _ain_cursor(0), _event_n_watched(0), _event_arm_seq(0), _event_head(0),
+      _event_tail(0), _event_dropped(0)
 #if USBIO_HAS_STREAM_TRANSPORT
       ,
       _stream_n_channels(0), _stream_running(0), _stream_flags(0),
@@ -72,6 +84,8 @@ UsbIoDevice::UsbIoDevice()
   }
   memset(_queue, 0, sizeof(_queue));
   memset(_reply, 0, sizeof(_reply));
+  memset(_event_watch, 0, sizeof(_event_watch));
+  memset(_event_ring, 0, sizeof(_event_ring));
 #if USBIO_HAS_STREAM_TRANSPORT
   memset(_stream_channels, 0, sizeof(_stream_channels));
   memset(_stream_ring, 0, sizeof(_stream_ring));
@@ -109,6 +123,10 @@ void UsbIoDevice::begin() {
   analogReadResolution(UsbIoBoard::AdcBits);
   analogWriteResolution(UsbIoBoard::PwmBits);
   _flags = UsbIoBoard::HasPulldown ? USBIO_FLAG_PULLDOWN : 0;
+  /* usbio_protocol.h, "Pin events": events are plain control transfers plus
+   * software scanning, no endpoint needed, so every board gets them -
+   * unlike USBIO_FLAG_STREAMING below, this does not depend on the transport. */
+  _flags |= USBIO_FLAG_EVENTS;
   _flags |= usbio_transport_begin();
 }
 
@@ -190,6 +208,26 @@ void UsbIoDevice::request_reset() {
   _stream_running = 0;
   _stream_n_channels = 0;
 #endif
+  /* usbio_protocol.h, "Event requests": RESET unwatches every pin and clears
+   * the queue. Both happen here, in the ISR: these are single-byte writes
+   * with no Arduino I/O, so it is ISR-safe exactly like the streaming reset
+   * above, and a CONFIG racing in right behind RESET is then correctly
+   * ordered after the clear.
+   *
+   * The queue is discarded by moving _event_tail - the index this side owns
+   * (EVENT_POP advances it) - up to a snapshot of poll()'s _event_head. Doing
+   * it the other way round, from poll(), would be a real hazard: poll() would
+   * have to write _event_head from a snapshot of _event_tail, and an
+   * EVENT_POP landing in between would leave tail one *ahead* of head, so
+   * (uint8_t)(head - tail) would read as 255 - a permanently "full" ring that
+   * drops every later edge. Moving tail forward can never overtake head, and
+   * at worst an edge pushed in the same instant as the RESET survives it. */
+  for (uint8_t i = 0; i < USBIO_MAX_EVENT_PINS; ++i) {
+    _event_watch[i].active = 0;
+  }
+  _event_n_watched = 0;
+  _event_tail = _event_head;
+  _event_dropped = 0;
   _reset_requests = (uint8_t)(_reset_requests + 1u);
 }
 
@@ -252,6 +290,7 @@ bool UsbIoDevice::handle_out(uint8_t bRequest, uint16_t wValue,
   case USBIO_REQ_DIO_WRITE:
   case USBIO_REQ_PWM_WRITE:
   case USBIO_REQ_DAC_WRITE:
+  case USBIO_REQ_EVENT_CONFIG:
     break;
   default:
     return stall(USBIO_BAD_CMD);
@@ -284,6 +323,16 @@ bool UsbIoDevice::handle_out(uint8_t bRequest, uint16_t wValue,
       _stream_running = 0;
     }
 #endif
+    /* usbio_protocol.h, "Event requests": taking a watched pin out of an
+     * INPUT* mode unwatches it, but its queued events stay readable (unlike
+     * EVENT_CONFIG's OFF, this does not touch the ring). */
+    if (!mode_is_input((uint8_t)wValue)) {
+      const int8_t idx = event_watch_index(pin);
+      if (idx >= 0) {
+        _event_watch[idx].active = 0;
+        --_event_n_watched;
+      }
+    }
     return true;
   case USBIO_REQ_DIO_WRITE:
     if (mode != USBIO_MODE_OUTPUT) {
@@ -307,6 +356,8 @@ bool UsbIoDevice::handle_out(uint8_t bRequest, uint16_t wValue,
       return stall(USBIO_BAD_VALUE);
     }
     return enqueue(bRequest, pin, wValue) ? true : stall(USBIO_QUEUE_FULL);
+  case USBIO_REQ_EVENT_CONFIG:
+    return handle_event_config(pin, wValue);
   default:
     return stall(USBIO_BAD_CMD);
   }
@@ -335,6 +386,8 @@ bool UsbIoDevice::handle_in(uint8_t bRequest, uint16_t wIndex,
     info.flags = _flags;
     info.stream_max_channels =
         (_flags & USBIO_FLAG_STREAMING) ? (uint8_t)USBIO_MAX_STREAM_CHANNELS : 0;
+    info.event_max_pins =
+        (_flags & USBIO_FLAG_EVENTS) ? (uint8_t)USBIO_MAX_EVENT_PINS : 0;
     memcpy(_reply, &info, sizeof(info));
     len = sizeof(info);
     break;
@@ -356,6 +409,27 @@ bool UsbIoDevice::handle_in(uint8_t bRequest, uint16_t wIndex,
     _last_error = USBIO_OK;
     len = sizeof(usbio_status_reply_t);
     break;
+  case USBIO_REQ_GET_TIME: {
+    /* usbio_protocol.h, GET_TIME: served straight from here, not from a
+     * shadow - millis()/micros() are lock-free ticker reads on every
+     * supported stack (verified: mbed's Timer/LowPowerTimer are documented
+     * "Synchronization level: Interrupt safe"; SAMD's millis() is a plain
+     * volatile word read and its micros() a lock-free retry loop against
+     * SysTick; Renesas's millis() is a plain volatile word read and its
+     * micros() brackets a register read with NVIC_DisableIRQ/EnableIRQ, not
+     * a mutex) - so the reply is the device's clock at the moment this
+     * request arrived, not at the last poll(). No `pending`/BUSY check: nothing
+     * here is shadow state. */
+    usbio_time_reply_t t;
+    t.status = USBIO_OK;
+    t.reserved = 0;
+    t.reserved2 = 0;
+    t.millis = millis();
+    t.micros = micros();
+    memcpy(_reply, &t, sizeof(t));
+    len = sizeof(t);
+    break;
+  }
   case USBIO_REQ_DIO_READ: {
     uint8_t status = USBIO_OK;
     uint8_t value = 0;
@@ -441,6 +515,81 @@ bool UsbIoDevice::handle_in(uint8_t bRequest, uint16_t wIndex,
 #else
     return stall(USBIO_UNSUPPORTED);
 #endif
+  case USBIO_REQ_EVENT_POP: {
+    /* usbio_protocol.h, "Event requests": never STALLs on an events build -
+     * status is always OK (usbio_event_header_t). No `pending`/BUSY check:
+     * EVENT_CONFIG applies synchronously in the ISR, so the watch table and
+     * ring are never "queued" the way pin commands are. */
+    uint16_t cap = wIndex;
+    if (cap == 0 || cap > USBIO_MAX_EVENTS_PER_POP) {
+      cap = USBIO_MAX_EVENTS_PER_POP;
+    }
+    usbio_event_header_t hdr;
+    hdr.status = USBIO_OK;
+    hdr.count = 0;
+    uint8_t tail = _event_tail;
+    uint16_t off = sizeof(hdr);
+    while (tail != _event_head && hdr.count < cap) {
+      const usbio_event_t &slot = _event_ring[tail & EventQueueMask];
+      tail = (uint8_t)(tail + 1u);
+      if (slot.pin == EventTombstone) {
+        continue; /* discarded by a since-issued EVENT_CONFIG OFF; skip it,
+                   * don't count it against `cap` or the reply */
+      }
+      memcpy(&_reply[off], &slot, sizeof(slot));
+      off = (uint16_t)(off + sizeof(slot));
+      ++hdr.count;
+    }
+    _event_tail = tail; /* ISR-only index: safe to advance from here */
+    hdr.dropped = _event_dropped;
+    _event_dropped = 0; /* usbio_protocol.h: "Reset dropped when it is
+                         * reported by a pop" */
+    hdr.pending = count_queued_events();
+    memcpy(_reply, &hdr, sizeof(hdr));
+    len = off;
+    break;
+  }
+  case USBIO_REQ_EVENT_COUNTS: {
+    /* usbio_protocol.h: "entries appear in the order the pins were armed" -
+     * the watch table itself never moves (UsbIo.h, EventWatch), so sort the
+     * currently-active slots by arm_seq instead. At most USBIO_MAX_EVENT_PINS
+     * (8) entries: a plain insertion sort is cheap enough for ISR context. */
+    uint8_t order[USBIO_MAX_EVENT_PINS];
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < USBIO_MAX_EVENT_PINS; ++i) {
+      if (_event_watch[i].active) {
+        order[n++] = i;
+      }
+    }
+    for (uint8_t a = 1; a < n; ++a) {
+      const uint8_t key = order[a];
+      int8_t b = (int8_t)(a - 1u);
+      while (b >= 0 && (int8_t)(_event_watch[order[b]].arm_seq -
+                                 _event_watch[key].arm_seq) > 0) {
+        order[b + 1] = order[b];
+        --b;
+      }
+      order[b + 1] = key;
+    }
+    usbio_event_header_t hdr;
+    hdr.status = USBIO_OK;
+    hdr.dropped = 0;  /* meaningful only for EVENT_POP replies */
+    hdr.pending = 0;  /* meaningful only for EVENT_POP replies */
+    hdr.count = n;
+    uint16_t off = sizeof(hdr);
+    for (uint8_t k = 0; k < n; ++k) {
+      const EventWatch &w = _event_watch[order[k]];
+      usbio_event_count_t ec;
+      ec.pin = w.pin;
+      ec.mode = w.edge_mode;
+      ec.count = w.count;
+      memcpy(&_reply[off], &ec, sizeof(ec));
+      off = (uint16_t)(off + sizeof(ec));
+    }
+    memcpy(_reply, &hdr, sizeof(hdr));
+    len = off;
+    break;
+  }
   default:
     return stall(USBIO_BAD_CMD); /* unknown bRequest: the only IN request that STALLs */
   }
@@ -474,6 +623,9 @@ void UsbIoDevice::poll() {
      * otherwise a read could observe pre-reset hardware with an empty queue. */
   } while (_reset_done != _reset_requests);
   refresh_shadow();
+  /* usbio_protocol.h, "Pin events": detection compares against the shadow
+   * refresh_shadow() just took, so it must run right after it. */
+  event_poll();
 #if USBIO_HAS_STREAM_TRANSPORT
   stream_poll();
 #endif
@@ -550,6 +702,8 @@ void UsbIoDevice::apply_reset() {
     _ain[p] = 0;
   }
   _ain_cursor = 0;
+  /* The event ring is NOT cleared here: that happens in request_reset(), on
+   * the side that owns _event_tail. See the comment there. */
 }
 
 void UsbIoDevice::refresh_shadow() {
@@ -583,6 +737,178 @@ uint16_t UsbIoDevice::read_analog(uint8_t pin) {
     return 0; /* mbed returns -1 for a pin without an ADC channel */
   }
   return v > 0xFFFF ? 0xFFFFu : (uint16_t)v;
+}
+
+/* ---- pin events -----------------------------------------------------------
+ * usbio_protocol.h, "Pin events": handle_event_config() runs in the ISR
+ * exactly like handle_out()'s other cases (validate, update state, never
+ * touch Arduino I/O); event_poll()/push_event() run from poll() like
+ * refresh_shadow(). Unlike streaming, none of this is behind a transport
+ * macro - every board gets events (UsbIo::begin() always sets the flag).
+ */
+
+int8_t UsbIoDevice::event_watch_index(uint8_t pin) const {
+  for (uint8_t i = 0; i < USBIO_MAX_EVENT_PINS; ++i) {
+    if (_event_watch[i].active && _event_watch[i].pin == pin) {
+      return (int8_t)i;
+    }
+  }
+  return -1;
+}
+
+uint8_t UsbIoDevice::find_free_event_slot() const {
+  for (uint8_t i = 0; i < USBIO_MAX_EVENT_PINS; ++i) {
+    if (!_event_watch[i].active) {
+      return i;
+    }
+  }
+  return 0; /* unreachable: the caller already checked _event_n_watched */
+}
+
+void UsbIoDevice::discard_events_for_pin(uint8_t pin) {
+  /* usbio_protocol.h: OFF "discards its queued events" - just this pin's,
+   * unlike RESET's whole-queue clear, so other pins' queued events must
+   * survive. _event_head is poll()-only (push_event()), so instead of
+   * touching the indices this tombstones matching slots in place: entries
+   * between _event_tail and _event_head are already published and poll()
+   * never revisits a slot once past it, so mutating their contents here is
+   * safe. */
+  for (uint8_t i = _event_tail; i != _event_head; ++i) {
+    usbio_event_t &slot = _event_ring[i & EventQueueMask];
+    if (slot.pin == pin) {
+      slot.pin = EventTombstone;
+    }
+  }
+}
+
+uint8_t UsbIoDevice::count_queued_events() const {
+  uint8_t n = 0;
+  for (uint8_t i = _event_tail; i != _event_head; ++i) {
+    if (_event_ring[i & EventQueueMask].pin != EventTombstone) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+bool UsbIoDevice::handle_event_config(uint8_t pin, uint16_t wValue) {
+  /* usbio_protocol.h, "Event requests": pin range was checked by
+   * handle_out()'s shared block. OFF is handled first and unconditionally -
+   * unwatching skips the capability/mode check on purpose, so a host can
+   * always stop watching a pin even after moving it to another mode (which
+   * already unwatched it). Arming then validates capability + mode, the edge
+   * value, and capacity, in that order. */
+  const uint8_t edge = (uint8_t)(wValue & 0xFFu);
+  int8_t idx = event_watch_index(pin);
+  if (edge == USBIO_EDGE_OFF) {
+    /* Unwatching an already-unwatched pin is a no-op (mirrors
+     * STREAM_SELECT's remove). */
+    if (idx >= 0) {
+      _event_watch[idx].active = 0;
+      --_event_n_watched;
+      discard_events_for_pin(pin);
+    }
+    return true;
+  }
+  if (!(_caps[pin] & USBIO_CAP_DIO) || !mode_is_input(_mode[pin])) {
+    return stall(USBIO_BAD_MODE);
+  }
+  if (edge >= USBIO_EDGE_COUNT) {
+    return stall(USBIO_BAD_VALUE);
+  }
+  const uint8_t debounce_ms = (uint8_t)(wValue >> 8);
+  if (idx < 0) {
+    /* Arming a pin that is not yet watched when event_max_pins are already
+     * watched -> BAD_VALUE (usbio_protocol.h, "Event requests"). */
+    if (_event_n_watched >= USBIO_MAX_EVENT_PINS) {
+      return stall(USBIO_BAD_VALUE);
+    }
+    idx = (int8_t)find_free_event_slot();
+    ++_event_n_watched;
+  }
+  /* Re-arming a watched pin replaces its mode and debounce and resets its
+   * counter (usbio_protocol.h). Fill every field the ISR owns before
+   * publishing via `active`/`arm_seq`, exactly like enqueue() publishes a
+   * queue slot: event_poll() reads `active` first and must never see a
+   * slot with a fresh arm_seq but a stale pin/edge_mode, or vice versa. */
+  EventWatch &w = _event_watch[idx];
+  w.pin = pin;
+  w.edge_mode = edge;
+  w.debounce_ms = debounce_ms;
+  compiler_barrier();
+  ++_event_arm_seq;
+  w.arm_seq = _event_arm_seq; /* poll() notices this changed and resets
+                               * `count` itself - see event_poll(). */
+  compiler_barrier();
+  w.active = 1;
+  return true;
+}
+
+void UsbIoDevice::push_event(uint8_t pin, uint8_t edge, uint16_t seq,
+                             uint32_t now) {
+  if ((uint8_t)(_event_head - _event_tail) >= USBIO_EVENT_QUEUE_DEPTH) {
+    /* usbio_protocol.h, "Pin events": drop the newest edge and saturate
+     * `dropped` - the per-pin counter was already bumped by the caller, so
+     * the host can still recover the exact edge count even though this
+     * edge's timing is lost. */
+    if (_event_dropped < 0xFFu) {
+      ++_event_dropped;
+    }
+    return;
+  }
+  usbio_event_t &slot = _event_ring[_event_head & EventQueueMask];
+  slot.pin = pin;
+  slot.edge = edge;
+  slot.seq = seq;
+  slot.t_ms = now;
+  compiler_barrier();
+  _event_head = (uint8_t)(_event_head + 1u);
+}
+
+void UsbIoDevice::event_poll() {
+  if (_n_pins == 0) {
+    return;
+  }
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < USBIO_MAX_EVENT_PINS; ++i) {
+    EventWatch &w = _event_watch[i];
+    if (!w.active) {
+      continue;
+    }
+    const uint8_t pin = w.pin;
+    if (w.seen_seq != w.arm_seq) {
+      /* Fresh (re)arm: usbio_protocol.h says re-arming "resets its counter" -
+       * `count` is poll()-owned (see UsbIo.h, EventWatch) precisely so this
+       * reset can never race EVENT_CONFIG bumping arm_seq from the ISR.
+       * Baseline against the shadow refresh_shadow() just took instead of
+       * comparing, so the first scan after an arm never reports a spurious
+       * edge, and start the debounce window already elapsed so a genuine
+       * first edge is not blocked. */
+      w.seen_seq = w.arm_seq;
+      w.count = 0;
+      w.prev_level = _dio[pin];
+      w.debounce_until = now;
+      continue;
+    }
+    const uint8_t level = _dio[pin];
+    if (level == w.prev_level) {
+      continue;
+    }
+    w.prev_level = level;
+    const bool rising = level != 0;
+    const bool matches = w.edge_mode == USBIO_EDGE_CHANGE ||
+                          (rising ? w.edge_mode == USBIO_EDGE_RISING
+                                  : w.edge_mode == USBIO_EDGE_FALLING);
+    if (!matches || (int32_t)(now - w.debounce_until) < 0) {
+      continue; /* wrong direction for the armed mode, or still inside the
+                 * debounce window - "first edge wins" (usbio_protocol.h,
+                 * "Pin events"): absorbed, not counted, not queued.        */
+    }
+    ++w.count; /* wraps; matches usbio_event_t.seq / usbio_event_count_t.count */
+    w.debounce_until = now + w.debounce_ms;
+    push_event(pin, rising ? USBIO_EDGE_RISING : USBIO_EDGE_FALLING, w.count,
+               now);
+  }
 }
 
 /* ---- streaming ----------------------------------------------------------

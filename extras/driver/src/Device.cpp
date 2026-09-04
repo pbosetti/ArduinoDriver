@@ -29,10 +29,14 @@ std::string describe_request(Request request, std::uint16_t index) {
   case Request::GetStatus:
   case Request::StreamStop:
   case Request::StreamStatus:
+  case Request::GetTime:
+  case Request::EventCounts:
   case Request::Reset:
     return std::string(to_string(request));
   case Request::StreamStart:
     return fmt::format("{} (flags 0x{:02X})", to_string(request), index);
+  case Request::EventPop:
+    return fmt::format("{} (max {})", to_string(request), index);
   default:
     return fmt::format("{} (pin {})", to_string(request), index);
   }
@@ -460,13 +464,159 @@ void Device::end_stream() noexcept {
   _stream->streaming.store(false, std::memory_order_release);
 }
 
+// ---- Device time --------------------------------------------------------
+
+DeviceTime Device::read_time() {
+  check_not_streaming("read_time");
+  const auto t0 = std::chrono::steady_clock::now();
+  std::array<std::byte, TimeReplyLen> reply{};
+  read_in(Request::GetTime, 0, reply, TimeReplyLen);
+  const auto t1 = std::chrono::steady_clock::now();
+  const TimeReply parsed = decode_time_reply(reply);
+
+  DeviceTime result;
+  result.millis = parsed.millis;
+  result.micros = parsed.micros;
+  result.micros64 = reconstruct_micros64(parsed.millis, parsed.micros);
+  result.round_trip = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+  result.host_time = t0 + (t1 - t0) / 2;
+  return result;
+}
+
+// ---- Pin events -----------------------------------------------------------
+
+void Device::require_events(std::string_view what) const {
+  if (!_info.events()) {
+    throw NotSupported(
+        fmt::format("{}: the {} firmware does not report USBIO_FLAG_EVENTS",
+                    what, board_name(_info.board_id)));
+  }
+}
+
+void Device::configure_event(std::uint8_t pin, EdgeMode edge,
+                             std::chrono::milliseconds debounce) {
+  check_not_streaming("configure_event");
+  require_events("configure_event");
+  pin_caps(pin); // range check only (InvalidPin); DIO + INPUT* mode is
+                // device-checked, like STREAM_SELECT's pin (see start_stream)
+  const auto edge_code = static_cast<std::uint8_t>(edge);
+  if (edge_code >= EdgeModeCount) {
+    throw InvalidValue(fmt::format("configure_event: unknown edge mode {}",
+                                   static_cast<unsigned>(edge_code)));
+  }
+  if (debounce.count() < 0 ||
+      debounce.count() > static_cast<std::chrono::milliseconds::rep>(MaxDebounceMs)) {
+    throw InvalidValue(fmt::format(
+        "configure_event: debounce {} ms is outside 0..{}", debounce.count(),
+        static_cast<unsigned>(MaxDebounceMs)));
+  }
+  const auto value =
+      encode_event_config_value(static_cast<std::uint8_t>(debounce.count()), edge);
+  send_out(Request::EventConfig, value, pin);
+}
+
+void Device::pop_events_once(std::uint16_t max_events,
+                             std::vector<PinEvent> &out, std::uint8_t *dropped,
+                             bool *pending) {
+  std::array<std::byte, event_pop_len(MaxEventsPerPop)> reply{};
+  const std::size_t n =
+      read_in(Request::EventPop, max_events, reply, EventHeaderLen);
+  const EventHeader header = decode_event_header(reply);
+  // header.count entries are expected to follow; a reply too short to hold
+  // them all (truncation, or -- since header.count is attacker/bug-facing
+  // wire data -- a bogus count) is a protocol error, checked before any
+  // decode_event() call would read past what the transport actually
+  // delivered.
+  const std::size_t expected = event_pop_len(header.count);
+  if (n < expected) {
+    throw ProtocolError(fmt::format(
+        "EVENT_POP: short reply ({} of {} bytes for {} events)", n, expected,
+        static_cast<unsigned>(header.count)));
+  }
+  for (std::size_t i = 0; i < header.count; ++i) {
+    out.push_back(decode_event(reply, i));
+  }
+  if (dropped != nullptr) {
+    *dropped = header.dropped;
+  }
+  if (pending != nullptr) {
+    *pending = header.pending != 0;
+  }
+}
+
+std::vector<PinEvent> Device::poll_events(std::uint8_t *dropped) {
+  check_not_streaming("poll_events");
+  require_events("poll_events");
+  std::vector<PinEvent> events;
+  unsigned total_dropped = 0;
+  bool pending = true;
+  while (pending) {
+    std::uint8_t batch_dropped = 0;
+    pop_events_once(0, events, &batch_dropped, &pending);
+    total_dropped = std::min(255u, total_dropped + batch_dropped);
+  }
+  if (dropped != nullptr) {
+    *dropped = static_cast<std::uint8_t>(total_dropped);
+  }
+  return events;
+}
+
+std::vector<EventCount> Device::event_counts() {
+  check_not_streaming("event_counts");
+  require_events("event_counts");
+  std::array<std::byte, event_counts_len(MaxEventPins)> reply{};
+  const std::size_t n =
+      read_in(Request::EventCounts, 0, reply, EventHeaderLen);
+  const EventHeader header = decode_event_header(reply);
+  const std::size_t expected = event_counts_len(header.count);
+  if (n < expected) {
+    throw ProtocolError(fmt::format(
+        "EVENT_COUNTS: short reply ({} of {} bytes for {} pins)", n, expected,
+        static_cast<unsigned>(header.count)));
+  }
+  std::vector<EventCount> result;
+  result.reserve(header.count);
+  for (std::size_t i = 0; i < header.count; ++i) {
+    result.push_back(decode_event_count(reply, i));
+  }
+  return result;
+}
+
+std::optional<PinEvent> Device::wait_event(std::chrono::milliseconds timeout,
+                                           std::chrono::milliseconds poll_interval) {
+  check_not_streaming("wait_event");
+  require_events("wait_event");
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    std::vector<PinEvent> single;
+    pop_events_once(1, single, nullptr, nullptr);
+    if (!single.empty()) {
+      return single.front();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return std::nullopt;
+    }
+    pause(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::min(poll_interval,
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - now))));
+  }
+}
+
 // ---- Transfers --------------------------------------------------------------
 
 void Device::send_out(Request request, std::uint16_t value,
                       std::uint16_t index) {
   try {
-    _transport->control_out(request_code(request), value, index,
-                            _options.timeout);
+    {
+      // Locked around exactly this one wire transfer -- see the threading
+      // contract in Device.h. Released before the GET_STATUS follow-up
+      // below, which takes the same lock again through raw_in().
+      std::lock_guard<std::mutex> io_lock(_io->mutex);
+      _transport->control_out(request_code(request), value, index,
+                              _options.timeout);
+    }
   } catch (const StallError &) {
     // The firmware rejected the request; GET_STATUS.last_error tells why.
     std::array<std::byte, StatusReplyLen> reply{};
@@ -517,8 +667,14 @@ std::size_t Device::read_in(Request request, std::uint16_t index,
 
 std::size_t Device::raw_in(Request request, std::uint16_t index,
                            std::span<std::byte> reply) {
-  const std::size_t n = _transport->control_in(request_code(request), 0, index,
-                                               reply, _options.timeout);
+  std::size_t n = 0;
+  {
+    // Locked around exactly this one wire transfer -- see the threading
+    // contract in Device.h.
+    std::lock_guard<std::mutex> io_lock(_io->mutex);
+    n = _transport->control_in(request_code(request), 0, index, reply,
+                               _options.timeout);
+  }
   if (n > reply.size()) {
     throw ProtocolError(
         fmt::format("{}: transport returned {} bytes for a {}-byte request",

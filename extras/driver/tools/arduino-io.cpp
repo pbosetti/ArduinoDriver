@@ -5,6 +5,7 @@
 // Exit codes: 0 success, 1 device or protocol error (message on stderr),
 // 2 usage error.
 #include "arduino_driver/Enumerator.h"
+#include "arduino_driver/EventWatcher.h"
 #include "arduino_driver/Stream.h"
 
 #include <cxxopts.hpp>
@@ -59,8 +60,14 @@ struct Settings {
   // `stream` only.
   bool hz_given{false};                  ///< --hz was explicitly passed
   std::optional<unsigned> period_us;     ///< --period-us
-  double stream_seconds{0.0};            ///< --seconds (0: run until Ctrl-C)
   std::optional<std::string> csv_path;   ///< --csv
+
+  // `stream` / `watch`.
+  double run_seconds{0.0}; ///< --seconds (0: run until Ctrl-C)
+
+  // `watch` only.
+  EdgeMode watch_edge{EdgeMode::Change}; ///< --edge
+  unsigned watch_debounce_ms{0};         ///< --debounce
 };
 
 // ---- Argument parsing -------------------------------------------------------
@@ -132,6 +139,21 @@ PinMode parse_mode(std::string_view text) {
   throw UsageError(fmt::format(
       "unknown mode \"{}\" (input|output|pullup|pulldown|analog|pwm|dac)",
       text));
+}
+
+EdgeMode parse_edge_mode(std::string_view text) {
+  const std::string m = lower(text);
+  if (m == "rising" || m == "rise" || m == "r") {
+    return EdgeMode::Rising;
+  }
+  if (m == "falling" || m == "fall" || m == "f") {
+    return EdgeMode::Falling;
+  }
+  if (m == "change" || m == "both" || m == "c") {
+    return EdgeMode::Change;
+  }
+  throw UsageError(
+      fmt::format("unknown edge \"{}\" (rising|falling|change)", text));
 }
 
 bool parse_level(std::string_view text) {
@@ -371,6 +393,21 @@ int cmd_status(Device &dev) {
   return ExitOk;
 }
 
+/// GET_TIME plus the host-side anchor: device millis()/micros(), the
+/// reconstructed 64-bit microsecond clock, and the round-trip-bounded
+/// estimate of how well host_time and micros64 line up (see DeviceTime).
+int cmd_time(Device &dev) {
+  const DeviceTime t = dev.read_time();
+  const double rtt_ms =
+      std::chrono::duration<double, std::milli>(t.round_trip).count();
+  fmt::print("millis:        {}\n", t.millis);
+  fmt::print("micros:        {}\n", t.micros);
+  fmt::print("micros64:      {} us\n", t.micros64);
+  fmt::print("round trip:    {:.3f} ms (host offset uncertainty +/- {:.3f} ms)\n",
+             rtt_ms, rtt_ms / 2.0);
+  return ExitOk;
+}
+
 /// Prints DIO levels and analog samples of the selected pins (all pins when
 /// none is given) until Ctrl-C. Pins must have been configured with `mode`
 /// beforehand: unconfigured pins read 0.
@@ -512,9 +549,9 @@ int cmd_stream(Device &dev, const std::vector<std::string> &args,
   std::vector<Sample> batch(pins.size() * 16);
   std::uint64_t total_samples = 0;
   while (!StopRequested.load()) {
-    if (s.stream_seconds > 0.0 &&
+    if (s.run_seconds > 0.0 &&
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
-                .count() >= s.stream_seconds) {
+                .count() >= s.run_seconds) {
       break;
     }
     const std::size_t n = stream.read(batch, 200ms);
@@ -548,6 +585,65 @@ int cmd_stream(Device &dev, const std::vector<std::string> &args,
   return ExitOk;
 }
 
+/// Arms the selected pins (EVENT_CONFIG via an EventWatcher, so ordinary
+/// Device calls from elsewhere would keep working too -- there is just no
+/// "elsewhere" in this CLI command) and prints each edge as it arrives until
+/// --seconds elapses or Ctrl-C, then a summary: the device-side EVENT_COUNTS
+/// per pin (exact even across drops) and the total the detailed feed had to
+/// drop.
+int cmd_watch(Device &dev, const std::vector<std::string> &args,
+             const Settings &s) {
+  require_args(args, 1,
+               "watch <pins> [--edge rising|falling|change] "
+               "[--debounce MS] [--seconds N]");
+  const std::vector<std::uint8_t> pins = parse_pin_list(args[0]);
+
+  EventWatcherConfig config;
+  for (const std::uint8_t pin : pins) {
+    config.pins.push_back(
+        {pin, s.watch_edge, std::chrono::milliseconds(s.watch_debounce_ms)});
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  EventWatcher watcher(dev, config, [&](const PinEvent &event) {
+    const double elapsed =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    fmt::print("{:>9.3f}s  pin {:<3} {:<7} (device t={} ms, edge #{})\n",
+               elapsed, event.pin, to_string(event.edge), event.t_ms,
+               event.seq);
+    std::fflush(stdout);
+  });
+
+  std::signal(SIGINT, on_interrupt);
+  while (!StopRequested.load()) {
+    if (s.run_seconds > 0.0 &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+                .count() >= s.run_seconds) {
+      break;
+    }
+    std::this_thread::sleep_for(50ms);
+  }
+
+  // Read the authoritative per-pin counters while the pins are still armed
+  // (stop() unwatches them, which clears each counter on the device).
+  const std::vector<EventCount> counts = dev.event_counts();
+  const EventWatcherStats watch_stats = watcher.stats();
+  watcher.stop();
+
+  fmt::print("\nwatch summary:\n");
+  for (const std::uint8_t pin : pins) {
+    const auto it =
+        std::find_if(counts.begin(), counts.end(),
+                    [pin](const EventCount &c) { return c.pin == pin; });
+    fmt::print("  pin {:<3} count {}\n", pin,
+               it != counts.end() ? it->count : 0);
+  }
+  fmt::print("delivered {} events, {} dropped from the detailed feed\n",
+            watch_stats.events_delivered, watch_stats.dropped);
+  return ExitOk;
+}
+
 constexpr std::string_view Commands = R"(Commands:
   list                      devices (bus:addr vid:pid board serial itf pins)
   info                      GET_INFO of the selected device
@@ -563,6 +659,8 @@ constexpr std::string_view Commands = R"(Commands:
   status                    last error and queue occupancy (GET_STATUS)
   sync                      wait until the command queue is empty
   reset                     every DIO pin back to INPUT, queue cleared
+  time                      device millis/micros, reconstructed 64-bit clock,
+                            and the round-trip-bounded host offset estimate
   monitor [--hz N] [pins]   print levels/samples until Ctrl-C (set modes first)
   stream <pins> [--hz N | --period-us N] [--seconds N] [--volts] [--csv FILE]
                             continuous sampling over the bulk endpoint; pins
@@ -570,6 +668,12 @@ constexpr std::string_view Commands = R"(Commands:
                             analog|input mode; CSV to stdout (or --csv FILE),
                             summary (rate, drops) to stderr; runs until
                             --seconds elapses or Ctrl-C
+  watch <pins> [--edge rising|falling|change] [--debounce MS] [--seconds N]
+                            print pin edges as they arrive (EVENT_CONFIG +
+                            EVENT_POP); pins are comma-separated and must
+                            already be in an INPUT* mode; final summary is
+                            per-pin counts (EVENT_COUNTS) and any dropped
+                            count; runs until --seconds elapses or Ctrl-C
 )";
 
 Device open_selected(const std::shared_ptr<Context> &context,
@@ -603,10 +707,14 @@ int run(int argc, char **argv) {
       cxxopts::value<double>()->default_value("10"))(
       "period-us", "stream sampling period, microseconds (0 = free running)",
       cxxopts::value<unsigned>())(
-      "seconds", "stream duration; omit to run until Ctrl-C",
+      "seconds", "stream/watch duration; omit to run until Ctrl-C",
       cxxopts::value<double>())(
       "csv", "stream: write CSV here instead of stdout",
       cxxopts::value<std::string>())(
+      "edge", "watch: edge(s) to report",
+      cxxopts::value<std::string>()->default_value("change"))(
+      "debounce", "watch: debounce window, ms (0..255)",
+      cxxopts::value<unsigned>()->default_value("0"))(
       "v,verbose", "libusb debug output on stderr")("h,help", "show this help")(
       "args", "command and arguments",
       cxxopts::value<std::vector<std::string>>());
@@ -647,11 +755,13 @@ int run(int argc, char **argv) {
     s.period_us = parsed["period-us"].as<unsigned>();
   }
   if (parsed.count("seconds") != 0) {
-    s.stream_seconds = parsed["seconds"].as<double>();
+    s.run_seconds = parsed["seconds"].as<double>();
   }
   if (parsed.count("csv") != 0) {
     s.csv_path = parsed["csv"].as<std::string>();
   }
+  s.watch_edge = parse_edge_mode(parsed["edge"].as<std::string>());
+  s.watch_debounce_ms = parsed["debounce"].as<unsigned>();
   s.verbose = parsed.count("verbose") != 0;
 
   std::vector<std::string> args;
@@ -670,7 +780,7 @@ int run(int argc, char **argv) {
     std::size_t min_args;
     std::string_view usage;
   };
-  constexpr std::array<Spec, 16> specs{{
+  constexpr std::array<Spec, 18> specs{{
       {"list", 0, "list"},
       {"info", 0, "info"},
       {"caps", 0, "caps"},
@@ -685,10 +795,14 @@ int run(int argc, char **argv) {
       {"status", 0, "status"},
       {"sync", 0, "sync"},
       {"reset", 0, "reset"},
+      {"time", 0, "time"},
       {"monitor", 0, "monitor [--hz N] [pins...]"},
       {"stream", 1,
        "stream <pins> [--hz N | --period-us N] [--seconds N] [--volts] "
        "[--csv FILE]"},
+      {"watch", 1,
+       "watch <pins> [--edge rising|falling|change] [--debounce MS] "
+       "[--seconds N]"},
   }};
   const auto spec = std::find_if(
       specs.begin(), specs.end(),
@@ -700,6 +814,9 @@ int run(int argc, char **argv) {
   require_args(args, spec->min_args, spec->usage);
   if (!(s.hz > 0.0)) {
     throw UsageError("--hz must be positive");
+  }
+  if (s.watch_debounce_ms > MaxDebounceMs) {
+    throw UsageError(fmt::format("--debounce must be 0..{}", MaxDebounceMs));
   }
 
   auto context = std::make_shared<Context>();
@@ -752,11 +869,17 @@ int run(int argc, char **argv) {
     dev.reset();
     return ExitOk;
   }
+  if (command == "time") {
+    return cmd_time(dev);
+  }
   if (command == "monitor") {
     return cmd_monitor(dev, args, s);
   }
   if (command == "stream") {
     return cmd_stream(dev, args, s);
+  }
+  if (command == "watch") {
+    return cmd_watch(dev, args, s);
   }
   throw UsageError(
       fmt::format("unknown command \"{}\"\n\n{}", command, Commands));

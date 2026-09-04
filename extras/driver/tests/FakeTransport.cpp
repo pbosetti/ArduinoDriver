@@ -248,6 +248,73 @@ std::size_t FakeTransport::control_in(std::uint8_t request, std::uint16_t value,
     len = StreamStatusLen;
     break;
 
+  case Request::GetTime:
+    // "always OK" per usbio_protocol.h: no pin/mode/busy checks.
+    write_u8(reply, TimeReplyOffset::Status, static_cast<std::uint8_t>(Status::Ok));
+    write_u8(reply, TimeReplyOffset::Reserved, 0);
+    write_u16le(reply, TimeReplyOffset::Reserved2, 0);
+    {
+      // The clock is also touched by set_millis()/set_micros()/
+      // advance_millis() from the test thread while an EventWatcher's
+      // worker thread may be reading it here.
+      std::lock_guard<std::mutex> lock(_mutex);
+      write_u32le(reply, TimeReplyOffset::Millis, _millis);
+      write_u32le(reply, TimeReplyOffset::Micros, _micros);
+    }
+    len = TimeReplyLen;
+    break;
+
+  case Request::EventPop: {
+    if ((_board.flags & USBIO_FLAG_EVENTS) == 0) {
+      stall(Status::Unsupported);
+    }
+    // wIndex = max events, 0 = as many as fit (min(MaxEventsPerPop, queued)).
+    std::lock_guard<std::mutex> lock(_mutex);
+    const std::size_t requested =
+        index == 0 ? MaxEventsPerPop : std::min<std::size_t>(index, MaxEventsPerPop);
+    const std::size_t n_events = std::min(requested, _event_queue.size());
+    write_u8(reply, EventHeaderOffset::Status, static_cast<std::uint8_t>(Status::Ok));
+    write_u8(reply, EventHeaderOffset::Count, static_cast<std::uint8_t>(n_events));
+    write_u8(reply, EventHeaderOffset::Dropped, _event_dropped);
+    _event_dropped = 0; // cleared by the read, like GET_STATUS.last_error
+    for (std::size_t i = 0; i < n_events; ++i) {
+      const QueuedEvent &e = _event_queue[i];
+      const std::size_t base = EventHeaderLen + i * EventLen;
+      write_u8(reply, base + EventOffset::Pin, e.pin);
+      write_u8(reply, base + EventOffset::Edge, static_cast<std::uint8_t>(e.edge));
+      write_u16le(reply, base + EventOffset::Seq, e.seq);
+      write_u32le(reply, base + EventOffset::TMs, e.t_ms);
+    }
+    _event_queue.erase(_event_queue.begin(),
+                       _event_queue.begin() + static_cast<std::ptrdiff_t>(n_events));
+    write_u8(reply, EventHeaderOffset::Pending,
+            static_cast<std::uint8_t>(std::min<std::size_t>(_event_queue.size(), 255)));
+    len = event_pop_len(n_events);
+    break;
+  }
+
+  case Request::EventCounts: {
+    if ((_board.flags & USBIO_FLAG_EVENTS) == 0) {
+      stall(Status::Unsupported);
+    }
+    std::lock_guard<std::mutex> lock(_mutex);
+    write_u8(reply, EventHeaderOffset::Status, static_cast<std::uint8_t>(Status::Ok));
+    write_u8(reply, EventHeaderOffset::Count,
+            static_cast<std::uint8_t>(_event_watch.size()));
+    write_u8(reply, EventHeaderOffset::Dropped, 0); // EVENT_POP-only field
+    write_u8(reply, EventHeaderOffset::Pending, 0);  // EVENT_POP-only field
+    for (std::size_t i = 0; i < _event_watch.size(); ++i) {
+      const EventWatch &w = _event_watch[i];
+      const std::size_t base = EventHeaderLen + i * EventCountLen;
+      write_u8(reply, base + EventCountOffset::Pin, w.pin);
+      write_u8(reply, base + EventCountOffset::Mode,
+              static_cast<std::uint8_t>(w.edge));
+      write_u16le(reply, base + EventCountOffset::Count, w.count);
+    }
+    len = event_counts_len(_event_watch.size());
+    break;
+  }
+
   default:
     // Unknown bRequest, or an OUT request issued in the IN direction.
     stall(Status::BadCmd);
@@ -298,6 +365,21 @@ void FakeTransport::control_out(std::uint8_t request, std::uint16_t value,
     _queue_full = false;
     _stream_running = false;
     _stream_selected.clear();
+    {
+      // RESET unwatches every pin and clears the event queue (see
+      // usbio_protocol.h "Event requests"); also touched by an
+      // EventWatcher's worker thread via EVENT_POP.
+      std::lock_guard<std::mutex> lock(_mutex);
+      _event_watch.clear();
+      _event_queue.clear();
+      _event_dropped = 0;
+    }
+    return;
+  case Request::EventConfig:
+    if ((_board.flags & USBIO_FLAG_EVENTS) == 0) {
+      stall(Status::Unsupported);
+    }
+    handle_event_config(value, index);
     return;
   case Request::StreamSelect:
     if ((_board.flags & USBIO_FLAG_STREAMING) == 0) {
@@ -343,6 +425,13 @@ void FakeTransport::control_out(std::uint8_t request, std::uint16_t value,
       stall(Status::QueueFull);
     }
     _mode[index] = mode; // intended mode, recorded at acceptance
+    if (!is_input_mode(mode)) {
+      // "A PIN_MODE that takes a watched pin out of an INPUT* mode
+      // unwatches it (its queued events remain readable)" -- usbio_protocol.h.
+      std::lock_guard<std::mutex> lock(_mutex);
+      unwatch_event_locked(static_cast<std::uint8_t>(index),
+                           /*purge_queue=*/false);
+    }
     return;
   }
   case Request::DioWrite:
@@ -419,12 +508,169 @@ std::uint16_t FakeTransport::dac_value(std::uint8_t pin) const {
 
 void FakeTransport::set_digital(std::uint8_t pin, bool high) {
   check_pin(pin);
-  _dio[pin] = high ? 1 : 0;
+  const std::uint8_t new_level = high ? 1 : 0;
+  if (_dio[pin] != new_level) {
+    // This is poll()'s "shadow just refreshed, compare against the
+    // previous one" moment (see usbio_protocol.h "Pin events"): only an
+    // actual level change is a candidate edge.
+    std::lock_guard<std::mutex> lock(_mutex);
+    handle_edge_locked(pin, high);
+  }
+  _dio[pin] = new_level;
 }
 
 void FakeTransport::set_analog(std::uint8_t pin, std::uint16_t raw) {
   check_pin(pin);
   _ain[pin] = raw;
+}
+
+// ---- Device clock and pin events --------------------------------------------
+
+void FakeTransport::set_millis(std::uint32_t ms) noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  _millis = ms;
+}
+
+void FakeTransport::set_micros(std::uint32_t us) noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  _micros = us;
+}
+
+void FakeTransport::advance_millis(std::uint32_t delta_ms) noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  _millis += delta_ms;                     // wraps like the real millis()
+  _micros += delta_ms * 1000u;            // wraps like the real micros()
+}
+
+std::uint32_t FakeTransport::fake_millis() const noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _millis;
+}
+
+std::uint32_t FakeTransport::fake_micros() const noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _micros;
+}
+
+std::vector<std::uint8_t> FakeTransport::watched_event_pins() const {
+  std::lock_guard<std::mutex> lock(_mutex);
+  std::vector<std::uint8_t> pins;
+  pins.reserve(_event_watch.size());
+  for (const EventWatch &w : _event_watch) {
+    pins.push_back(w.pin);
+  }
+  return pins;
+}
+
+std::size_t FakeTransport::event_queue_size() const noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _event_queue.size();
+}
+
+std::uint8_t FakeTransport::pending_event_drops() const noexcept {
+  std::lock_guard<std::mutex> lock(_mutex);
+  return _event_dropped;
+}
+
+void FakeTransport::handle_edge_locked(std::uint8_t pin, bool new_level) {
+  const auto it =
+      std::find_if(_event_watch.begin(), _event_watch.end(),
+                  [pin](const EventWatch &w) { return w.pin == pin; });
+  if (it == _event_watch.end()) {
+    return; // not watched
+  }
+  const EdgeMode edge = new_level ? EdgeMode::Rising : EdgeMode::Falling;
+  if (it->edge != EdgeMode::Change && it->edge != edge) {
+    return; // armed mode does not want this direction
+  }
+  // Debounce: "first edge wins" -- once accepted, further edges on this pin
+  // are ignored until the window has passed. Unsigned subtraction wraps
+  // correctly even across a millis() rollover, as long as the true elapsed
+  // time is under ~49.7 days.
+  if (it->debounce_ms != 0 && it->last_accept_ms.has_value()) {
+    const auto elapsed =
+        static_cast<std::uint32_t>(_millis - *it->last_accept_ms);
+    if (elapsed < it->debounce_ms) {
+      return;
+    }
+  }
+  it->last_accept_ms = _millis;
+  it->count = static_cast<std::uint16_t>(it->count + 1); // wraps; counts
+                                                          // every accepted
+                                                          // edge regardless
+                                                          // of queue fate
+  if (_event_queue.size() >= EventQueueDepth) {
+    if (_event_dropped < 255) {
+      ++_event_dropped;
+    }
+    return; // ring full: the newest edge is dropped (but already counted)
+  }
+  _event_queue.push_back({pin, edge, it->count, _millis});
+}
+
+void FakeTransport::unwatch_event_locked(std::uint8_t pin, bool purge_queue) {
+  const auto it =
+      std::find_if(_event_watch.begin(), _event_watch.end(),
+                  [pin](const EventWatch &w) { return w.pin == pin; });
+  if (it == _event_watch.end()) {
+    return;
+  }
+  _event_watch.erase(it);
+  if (purge_queue) {
+    _event_queue.erase(
+        std::remove_if(_event_queue.begin(), _event_queue.end(),
+                       [pin](const QueuedEvent &e) { return e.pin == pin; }),
+        _event_queue.end());
+  }
+}
+
+void FakeTransport::handle_event_config(std::uint16_t value,
+                                        std::uint16_t index) {
+  // Order per usbio_protocol.h "Event requests": pin range, [mode, value for
+  // arming], capacity. EdgeMode::Off (unwatch) is accepted unconditionally
+  // once the pin index is valid: like STREAM_SELECT's "removing an
+  // unselected pin is a no-op", disarming does not require the pin to
+  // currently be a valid input, so "configure_event(pin, Off)" is always a
+  // safe way to say "stop watching this pin" -- including from a clean
+  // teardown that already moved the pin to a different mode, or an
+  // EventWatcher's best-effort disarm on a pin it never actually got to arm.
+  if (index >= _board.n_pins()) {
+    stall(Status::BadPin);
+  }
+  const auto pin = static_cast<std::uint8_t>(index);
+  const auto edge_code = static_cast<std::uint8_t>(value & 0xFFu);
+  if (edge_code == USBIO_EDGE_OFF) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    unwatch_event_locked(pin, /*purge_queue=*/true);
+    return;
+  }
+  if (!(PinCaps{_board.caps[pin]}.dio() && is_input_mode(_mode[pin]))) {
+    stall(Status::BadMode);
+  }
+  if (edge_code >= USBIO_EDGE_COUNT) {
+    stall(Status::BadValue);
+  }
+  const auto edge = static_cast<EdgeMode>(edge_code);
+  const auto debounce_ms = static_cast<std::uint8_t>((value >> 8) & 0xFFu);
+
+  std::lock_guard<std::mutex> lock(_mutex);
+  const auto it =
+      std::find_if(_event_watch.begin(), _event_watch.end(),
+                  [pin](const EventWatch &w) { return w.pin == pin; });
+  const bool already_watched = it != _event_watch.end();
+  if (!already_watched && _event_watch.size() >= _board.event_max_pins) {
+    stall(Status::BadValue);
+  }
+  if (already_watched) {
+    it->edge = edge;
+    it->debounce_ms = debounce_ms;
+    it->count = 0;
+    it->last_accept_ms.reset();
+    // Re-arming replaces mode/debounce and resets the counter, but does not
+    // discard already-queued events for the pin (only EdgeMode::Off does).
+  } else {
+    _event_watch.push_back({pin, edge, debounce_ms, 0, std::nullopt});
+  }
 }
 
 std::vector<LoggedRequest> FakeTransport::log() const {
@@ -492,7 +738,8 @@ std::size_t FakeTransport::encode_info(std::span<std::byte> out) {
   write_u16le(out, InfoOffset::IoMv, _board.io_mv);
   write_u16le(out, InfoOffset::Flags, _board.flags);
   write_u8(out, InfoOffset::StreamMaxChannels, _board.stream_max_channels);
-  for (std::size_t i = 0; i < 3; ++i) {
+  write_u8(out, InfoOffset::EventMaxPins, _board.event_max_pins);
+  for (std::size_t i = 0; i < 2; ++i) {
     write_u8(out, InfoOffset::Reserved + i, 0);
   }
   return InfoLen;

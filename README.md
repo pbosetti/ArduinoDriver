@@ -177,6 +177,10 @@ carry the pin in `wIndex` and the argument in `wValue` and have no data stage.
 | `0x10 DIO_READ_ALL` | IN | – | – | status + bitmap, bit *i* = pin *i* |
 | `0x11 AI_READ_ALL` | IN | – | – | status + u16 per analog pin, ascending pin order |
 | `0x20 GET_STATUS` | IN | – | – | pending commands, reason of the last STALL |
+| `0x21 GET_TIME` | IN | – | – | device `millis` and `micros` (u32 each) |
+| `0x40 EVENT_CONFIG` | OUT | pin | debounce ms << 8 \| edge mode | – |
+| `0x41 EVENT_POP` | IN | max events | – | header + queued edges `{pin, edge, seq, t_ms}` |
+| `0x42 EVENT_COUNTS` | IN | – | – | per-watched-pin edge counters |
 | `0x30 STREAM_SELECT` | OUT | pin | 0 remove / 1 add | – |
 | `0x31 STREAM_START` | OUT | flags | period µs (0 = free running) | – |
 | `0x32 STREAM_STOP` | OUT | – | – | – |
@@ -255,6 +259,47 @@ overruns, gaps, drops or resyncs. The ceiling has not been measured yet — the
 firmware samples at most one record per `poll()` call, so the practical limit
 is the sketch's loop rate rather than the bus.
 
+## Pin events and device time
+
+Both work on **every** board, Renesas included: they are plain control
+transfers and need no endpoint.
+
+```bash
+arduino-io mode 5 pulldown
+arduino-io watch 5 --edge change --debounce 20     # until Ctrl-C
+arduino-io time                                     # device clock + host offset
+```
+
+```cpp
+dev.configure_event(5, EdgeMode::Change, 20ms);
+for (const PinEvent &e : dev.poll_events()) { ... }   // non-blocking drain
+std::optional<PinEvent> ev = dev.wait_event(500ms);   // blocking with timeout
+
+// or a callback on a worker thread; arms the pins, disarms them on destruction
+EventWatcher watcher(dev, {.pins = {{5, EdgeMode::Change, 20ms}}},
+                     [](const PinEvent &e) { /* runs on the worker */ });
+```
+
+Edges are found by **scanning**: `poll()` compares the digital shadow it just
+refreshed against the previous one. That covers buttons and other human-scale
+contacts on any DIO input pin, with no interrupt-capable-pin restriction — but
+a pulse shorter than one `loop()` iteration can be missed, so it is not for
+encoders or tachometers. Debounce (0–255 ms, "first edge wins") is applied on
+the device; with `--debounce 0` a bouncing contact reports every edge the scan
+catches.
+
+The event queue is bounded, so a flood can drop events — but the per-pin
+counters from `EVENT_COUNTS` never do. "How many presses happened" is always
+answerable exactly; only "when exactly" degrades. A watcher's worker thread may
+poll while your own thread drives pins: `Device` serialises control transfers
+internally.
+
+`GET_TIME` returns `millis` and `micros` together, answered in the USB
+interrupt so it timestamps the request's arrival. Sending both matters:
+`micros` wraps every ~71.6 minutes, but since `micros == millis × 1000 (mod
+2³²)` the host rebuilds a 64-bit microsecond clock good for 49.7 days — which
+is what anchors stream `t_us` and event `t_ms` to host time, to about ±RTT/2.
+
 ## Board support
 
 | board | FQBN | status | notes |
@@ -325,6 +370,12 @@ Nano RP2040 Connect D24–D29) they are addressable, exactly as a sketch could
    `arduino-io stream 15,16 --hz 1000 --seconds 3` then samples two analog
    pins over the bulk endpoint (set their modes first). The summary line must
    report the requested rate with zero gaps, drops and resyncs.
+9. `arduino-io time` prints the device clock and the estimated host offset.
+   `arduino-io mode 5 pulldown && arduino-io watch 5 --debounce 20` then
+   reports one rising edge each time pin 5 is tied to 3V3 and one falling edge
+   when it is released. Without `--debounce` a bouncing contact can report
+   several edges per press: the scan only filters bounce shorter than one
+   `loop()` iteration.
 
 ## Limitations and follow-ups
 

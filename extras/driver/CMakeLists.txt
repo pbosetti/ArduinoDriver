@@ -128,11 +128,13 @@ add_library(arduino_driver STATIC
   include/arduino_driver/Transport.h
   include/arduino_driver/Device.h
   include/arduino_driver/Stream.h
+  include/arduino_driver/EventWatcher.h
   include/arduino_driver/LibusbTransport.h
   include/arduino_driver/Enumerator.h
   src/LibusbDetail.h
   src/Device.cpp
   src/Stream.cpp
+  src/EventWatcher.cpp
   src/LibusbTransport.cpp
   src/Enumerator.cpp
 )
