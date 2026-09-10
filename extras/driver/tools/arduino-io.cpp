@@ -265,17 +265,23 @@ int cmd_info(Device &dev) {
              static_cast<unsigned>(info.board_id));
   fmt::print("protocol version: 0x{:04X}\n", info.protocol_version);
   fmt::print("pins:             {} (analog: {})\n", info.n_pins, info.n_ain);
-  fmt::print(
-      "resolution:       adc {} bits,  mode <pin> <mode>         "
-      "input|output|pullup|pulldown|analog|pwm|dac{} bits, dac {} bits{}\n",
-      info.adc_bits, info.pwm_bits, info.dac_bits,
-      info.has_dac() ? "" : " (no DAC)");
+  fmt::print("resolution:       adc {} bits, pwm {} bits, dac {} bits{}\n",
+             info.adc_bits, info.pwm_bits, info.dac_bits,
+             info.has_dac() ? "" : " (no DAC)");
   fmt::print("voltages:         vref {} mV, io {} mV\n", info.vref_mv,
              info.io_mv);
-  fmt::print("flags:            0x{:04X}{}{}\n", info.flags,
+  fmt::print("flags:            0x{:04X}{}{}{}{}\n", info.flags,
              info.has_vendor_interface() ? " vendor-interface" : "",
-             info.supports_pulldown() ? " pulldown" : "");
+             info.supports_pulldown() ? " pulldown" : "",
+             info.streaming() ? " streaming" : "",
+             info.events() ? " events" : "");
   fmt::print("queue depth:      {}\n", info.queue_depth);
+  if (info.streaming()) {
+    fmt::print("stream channels:  up to {}\n", info.stream_max_channels);
+  }
+  if (info.events()) {
+    fmt::print("event pins:       up to {}\n", info.event_max_pins);
+  }
   if (const auto *usb =
           dynamic_cast<const LibusbTransport *>(&dev.transport())) {
     fmt::print(

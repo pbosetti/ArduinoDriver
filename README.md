@@ -66,15 +66,7 @@ available for debugging.
 
 ### 1. Firmware
 
-Install *UsbIo* from the Library Manager, or symlink/clone this repository into
-your sketchbook `libraries/` folder, then open
-*File ▸ Examples ▸ UsbIo ▸ UsbIoDevice*. With `arduino-cli`, from a clone:
-
-```bash
-arduino-cli compile --fqbn arduino:mbed_portenta:envie_m7 --library . examples/UsbIoDevice
-```
-
-The whole sketch is:
+The whole sketch is three lines — the library does the rest:
 
 ```cpp
 #include <UsbIo.h>
@@ -82,10 +74,76 @@ void setup() { UsbIo.begin(); }
 void loop()  { UsbIo.poll(); }
 ```
 
-The root `CMakeLists.txt` wraps the same commands as targets
-(`firmware-portenta`, `firmware-minima`, `firmware-mkrzero`, … and
-`upload-<board>` with `-DUSBIO_UPLOAD_PORT=/dev/cu.usbmodemXXXX`) when
-`arduino-cli` is on `PATH`.
+First install the core for your board, once per machine — `arduino:mbed_portenta`
+for a Portenta H7, `arduino:renesas_uno` for an UNO R4, `arduino:samd` for a
+MKR/Zero/Nano 33 IoT (see [Board support](#board-support) for the FQBN of each):
+
+```bash
+arduino-cli core install arduino:mbed_portenta
+```
+
+Then pick one of three routes.
+
+**Arduino IDE.** Install *UsbIo* from the Library Manager, or clone/symlink this
+repository into your sketchbook `libraries/` folder, then open
+*File ▸ Examples ▸ UsbIo ▸ UsbIoDevice*, select your board and press Upload.
+
+**`arduino-cli`, from a clone.** Find the port, then compile and upload in one
+step (`--library .` makes the repository itself the library):
+
+```bash
+arduino-cli board list          # -> /dev/cu.usbmodem1102, arduino:mbed_portenta:envie_m7
+arduino-cli compile --fqbn arduino:mbed_portenta:envie_m7 --library . \
+  --warnings all -u -p /dev/cu.usbmodem1102 examples/UsbIoDevice
+```
+
+Drop `-u -p <port>` to compile without uploading.
+
+**CMake targets.** When `arduino-cli` is on `PATH`, the root `CMakeLists.txt`
+adds one target per board — `firmware-portenta`, `firmware-giga`,
+`firmware-nano33ble`, `firmware-nanorp2040`, `firmware-minima`,
+`firmware-nanor4`, `firmware-mkrzero`, `firmware-nano33iot`, `firmware-zero`,
+plus `firmware-all` for every core you have installed:
+
+```bash
+cmake -Bbuild -G Ninja
+cmake --build build --target firmware-portenta      # -> build/firmware/portenta
+```
+
+Uploading needs the port in the CMake cache, so it is a two-step affair:
+
+```bash
+cmake -Bbuild -DUSBIO_UPLOAD_PORT=/dev/cu.usbmodem1102
+cmake --build build --target upload-portenta
+```
+
+**If the upload fails to find the board**, put it in bootloader mode: on the
+mbed boards (Portenta, GIGA, Nano 33 BLE) double-tap the reset button — the
+LED breathes — and on SAMD boards double-tap too. The board enumerates under a
+*different* port in bootloader mode, so re-run `arduino-cli board list` and use
+the new one. The port also changes after a successful upload, when the board
+re-enumerates running UsbIo.
+
+**Check it worked** — this needs the host driver from step 2:
+
+```bash
+$ build/extras/driver/arduino-io info
+board:            Portenta H7 (id 0x0201)
+protocol version: 0x0001
+pins:             26 (analog: 7)
+resolution:       adc 16 bits, pwm 12 bits, dac 12 bits
+voltages:         vref 3300 mV, io 3300 mV
+flags:            0x000F vendor-interface pulldown streaming events
+queue depth:      32
+stream channels:  up to 8
+event pins:       up to 8
+transport:        device recipient, interface 0 (claimed)
+```
+
+The `flags` line is the quickest way to confirm *which* firmware is on the
+board: `streaming` and `events` appear only if it was built from a revision
+that has them. The CDC serial port keeps working throughout, so `Serial.print()`
+stays available for your own debugging.
 
 ### 2. Host driver
 
