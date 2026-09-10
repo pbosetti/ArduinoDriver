@@ -50,7 +50,7 @@ const uint8_t EventQueueMask = (uint8_t)(USBIO_EVENT_QUEUE_DEPTH - 1u);
  * copies a slot, then releases it by bumping _tail. Both run on one core, so
  * no hardware fence is needed, but the compiler must not move the slot
  * accesses across the index write. */
-inline void compiler_barrier() { __asm__ __volatile__("" ::: "memory"); }
+inline void usbio_compiler_barrier() { __asm__ __volatile__("" ::: "memory"); }
 
 inline uint16_t full_scale(uint8_t bits) {
   return bits >= 16u ? 0xFFFFu : (uint16_t)((1u << bits) - 1u);
@@ -189,7 +189,7 @@ bool UsbIoDevice::enqueue(uint8_t cmd, uint8_t pin, uint16_t value) {
   slot.pin = pin;
   slot.epoch = _epoch;
   slot.value = value;
-  compiler_barrier();
+  usbio_compiler_barrier();
   _head = (uint8_t)(head + 1u);
   return true;
 }
@@ -613,7 +613,7 @@ void UsbIoDevice::poll() {
     while (_tail != _head) {
       const uint8_t tail = _tail;
       const Command c = _queue[tail & QueueMask];
-      compiler_barrier();
+      usbio_compiler_barrier();
       _tail = (uint8_t)(tail + 1u);
       if (c.epoch == _epoch) {
         execute(c);
@@ -835,11 +835,11 @@ bool UsbIoDevice::handle_event_config(uint8_t pin, uint16_t wValue) {
   w.pin = pin;
   w.edge_mode = edge;
   w.debounce_ms = debounce_ms;
-  compiler_barrier();
+  usbio_compiler_barrier();
   ++_event_arm_seq;
   w.arm_seq = _event_arm_seq; /* poll() notices this changed and resets
                                * `count` itself - see event_poll(). */
-  compiler_barrier();
+  usbio_compiler_barrier();
   w.active = 1;
   return true;
 }
@@ -861,7 +861,7 @@ void UsbIoDevice::push_event(uint8_t pin, uint8_t edge, uint16_t seq,
   slot.edge = edge;
   slot.seq = seq;
   slot.t_ms = now;
-  compiler_barrier();
+  usbio_compiler_barrier();
   _event_head = (uint8_t)(_event_head + 1u);
 }
 
