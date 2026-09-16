@@ -40,6 +40,9 @@ namespace ArduinoDriver {
 
 class Device;
 
+/// Default for StreamConfig::queue_capacity.
+inline constexpr std::size_t DefaultStreamQueueCapacity = 1024;
+
 /// One decoded channel reading from a stream record.
 struct Sample {
   std::uint8_t pin{0};    ///< the pin this sample belongs to
@@ -61,6 +64,10 @@ struct StreamConfig {
   std::chrono::microseconds period{0};
   /// enum usbio_stream_flags bits (StreamFlags::Digital / StopOnOverrun).
   std::uint8_t flags{0};
+  /// Bound on decoded records queued for read(); when full, the oldest
+  /// record is dropped and counted in StreamStats::host_drops. Must be > 0
+  /// (else InvalidValue).
+  std::size_t queue_capacity{DefaultStreamQueueCapacity};
 };
 
 /// Counters accumulated by a Stream since it started.
@@ -73,6 +80,7 @@ struct StreamStats {
                                 ///< .seq (device-side drops and lost packets)
   std::uint64_t host_drops{0};  ///< decoded records the host had to discard
                                 ///< because the consumer was not keeping up
+                                ///< (StreamConfig::queue_capacity exceeded)
   std::uint64_t resyncs{0};     ///< times the byte stream lost sync on
                                 ///< USBIO_STREAM_MAGIC and had to resync
 };

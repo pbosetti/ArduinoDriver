@@ -31,10 +31,6 @@ constexpr std::size_t ChunkSize = 4096;
 constexpr std::chrono::milliseconds IoTimeout{200};
 /// How often the worker refreshes device_overruns via GET_STREAM_STATUS.
 constexpr std::chrono::milliseconds StatusPollInterval{200};
-/// Bound on queued-but-unread records, so a consumer that stops calling
-/// read() does not grow the queue without limit; overflow counts as
-/// host_drops.
-constexpr std::size_t MaxReadyRecords = 1024;
 } // namespace
 
 // ---- Device trampolines ------------------------------------------------------
@@ -85,7 +81,7 @@ void Stream::Impl::deliver(std::vector<Sample> samples) {
   }
   {
     std::lock_guard<std::mutex> lock(mutex);
-    if (ready.size() >= MaxReadyRecords) {
+    while (ready.size() >= config.queue_capacity) {
       ready.pop_front();
       ++stats.host_drops;
     }

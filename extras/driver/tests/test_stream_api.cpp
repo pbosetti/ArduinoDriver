@@ -171,6 +171,13 @@ TEST_CASE("start_stream validates pins/period locally before any USB traffic",
     CHECK_THROWS_AS(rig.device.start_stream(config), InvalidValue);
     CHECK(rig.fake.log().empty());
   }
+  SECTION("queue_capacity 0") {
+    StreamConfig config;
+    config.pins = {19};
+    config.queue_capacity = 0;
+    CHECK_THROWS_AS(rig.device.start_stream(config), InvalidValue);
+    CHECK(rig.fake.log().empty());
+  }
   SECTION("period 0 (free running) is fine") {
     StreamConfig config;
     config.pins = {19};

@@ -403,6 +403,9 @@ Stream Device::start_stream(StreamConfig config) {
                     period_raw, StreamMinPeriodUs));
   }
   const auto period_us = static_cast<std::uint16_t>(period_raw);
+  if (config.queue_capacity == 0) {
+    throw InvalidValue("start_stream: queue_capacity must be > 0");
+  }
 
   std::lock_guard<std::mutex> lock(_stream->mutex);
   // STREAM_STOP keeps the selection: drop pins an earlier stream on this

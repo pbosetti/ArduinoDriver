@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <span>
+#include <thread>
 #include <vector>
 
 using namespace ArduinoDriver;
@@ -42,6 +43,22 @@ std::vector<Sample> drain(Stream &stream, std::size_t want) {
   }
   REQUIRE(total == want);
   return out;
+}
+
+/// Spins until `stream`'s host_drops counter reaches `want`, or fails the
+/// test after a generous number of attempts. Used to make a queue_capacity
+/// overflow test deterministic: Impl::deliver() bumps host_drops and pushes
+/// the surviving record onto `ready` under the same lock, so observing the
+/// wanted host_drops count here guarantees the queue already holds exactly
+/// the records that are meant to survive -- unlike records_received, which
+/// Impl::worker_main() increments *before* calling deliver() for that
+/// record, so waiting on it can race ahead of the corresponding drop.
+void wait_for_host_drops(Stream &stream, std::uint64_t want) {
+  for (int attempt = 0;
+       attempt < 500 && stream.stats().host_drops < want; ++attempt) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE(stream.stats().host_drops == want);
 }
 
 } // namespace
@@ -175,6 +192,35 @@ TEST_CASE("Stream accounts for device-side seq gaps", "[stream][decoding]") {
   const StreamStats stats = stream.stats();
   CHECK(stats.records_received == 3);
   CHECK(stats.seq_gaps == 3);
+}
+
+TEST_CASE("Stream drops the oldest records beyond queue_capacity",
+          "[stream][decoding]") {
+  Rig rig(streaming_board(), fast_options());
+  rig.device.pin_mode(15, PinMode::AnalogIn);
+  StreamConfig config;
+  config.pins = {15};
+  config.queue_capacity = 2;
+  Stream stream = rig.device.start_stream(config);
+
+  rig.fake.set_stream_ramp(/*start=*/100, /*step=*/10, /*t0_us=*/1000,
+                           /*dt_us=*/500);
+  rig.fake.queue_stream_records(5);
+
+  // Let the worker decode and drop every excess record before reading: with
+  // capacity 2 and 5 records, exactly 3 drops must have happened (records
+  // 0/1/2) by the time read() runs.
+  wait_for_host_drops(stream, 3);
+
+  const std::vector<Sample> samples = drain(stream, 2);
+  CHECK(samples[0].raw == 130);   // record 3 (0-based): 100 + 10*3
+  CHECK(samples[0].t_us == 2500); // 1000 + 500*3
+  CHECK(samples[1].raw == 140);   // record 4: 100 + 10*4
+  CHECK(samples[1].t_us == 3000); // 1000 + 500*4
+
+  const StreamStats stats2 = stream.stats();
+  CHECK(stats2.records_received == 5);
+  CHECK(stats2.host_drops == 3);
 }
 
 TEST_CASE("Stream record framing accounts for the padded digital bitmap",
