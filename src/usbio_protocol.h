@@ -274,8 +274,9 @@ enum usbio_board_id {
 
 /* Streaming */
 #define USBIO_STREAM_MAGIC 0x5355u   /* 'U','S' little-endian; starts a record */
-#define USBIO_STREAM_EP_SIZE 64u     /* bulk IN max packet size (full speed);
-                                      * hosts use the descriptor's value       */
+#define USBIO_STREAM_EP_SIZE 64u     /* bulk IN max packet size at full speed
+                                      * (high speed boards declare 512); hosts
+                                      * use the descriptor's value             */
 #define USBIO_MAX_STREAM_CHANNELS 8u /* upper bound on stream_max_channels     */
 #define USBIO_STREAM_MIN_PERIOD_US 100u /* fastest period a device must accept;
                                          * 0 means free running                */

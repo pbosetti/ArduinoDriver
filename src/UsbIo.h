@@ -36,6 +36,17 @@
 #define USBIO_HAS_STREAM_TRANSPORT 0
 #endif
 
+/* Size of the core's stream packet buffer: an upper bound on
+ * usbio_transport_stream_packet_max() (transport/UsbIoTransport.h). The mbed
+ * boards built on the STM32H7 OTG_HS core enumerate at High Speed, where a
+ * bulk endpoint's wMaxPacketSize is 512, so mbed reserves room for a full High
+ * Speed packet minus one byte; SAMD is Full Speed only. */
+#if defined(ARDUINO_ARCH_MBED)
+#define USBIO_STREAM_PACKET_MAX_LEN 511u
+#else
+#define USBIO_STREAM_PACKET_MAX_LEN (USBIO_STREAM_EP_SIZE - 1u)
+#endif
+
 class UsbIoDevice {
 public:
   UsbIoDevice();
@@ -132,14 +143,15 @@ private:
 #if USBIO_HAS_STREAM_TRANSPORT
   /* Every record fits in one bulk packet: USBIO_MAX_STREAM_CHANNELS (8) and
    * USBIO_MAX_PINS (128, i.e. a 16-byte digital bitmap) bound header +
-   * samples + bitmap at 44 bytes, well under USBIO_STREAM_EP_SIZE (64) - see
-   * the USBIO_STATIC_ASSERT below. The device therefore never needs to
+   * samples + bitmap at 44 bytes, under even a Full Speed packet's payload
+   * (USBIO_STREAM_EP_SIZE - 1 = 63, see usbio_transport_stream_packet_max())
+   * - see the USBIO_STATIC_ASSERT below. The device therefore never needs to
    * straddle a record across two packets even though the wire format (and
    * the host's reassembly) allows it. */
   static const uint16_t StreamRecordMaxLen =
       (uint16_t)(sizeof(usbio_stream_header_t) + 2u * USBIO_MAX_STREAM_CHANNELS +
                  ((((USBIO_MAX_PINS + 7u) / 8u) + 1u) & ~1u));
-  USBIO_STATIC_ASSERT(StreamRecordMaxLen <= USBIO_STREAM_EP_SIZE,
+  USBIO_STATIC_ASSERT(StreamRecordMaxLen <= USBIO_STREAM_EP_SIZE - 1u,
                       "a stream record must always fit in one bulk packet");
 
   /* One buffered record, ready to hand to the transport verbatim. */
@@ -168,6 +180,15 @@ private:
    * timeouts once, instead of one on every poll() call for ever. A healthy
    * stream reports BUSY, never FAILED, so this can never stop it. */
   static const uint8_t StreamTxFailureLimit = 3;
+
+  /* Longest a record may wait in a partly filled bulk packet before the
+   * packet is sent anyway (stream_poll()). Without it, a bus as fast as High
+   * Speed collects every packet before the next record is even sampled, so
+   * each record would travel in its own transfer: 10 kHz of samples would be
+   * 10 000 IN transactions per second. Holding records back for up to this
+   * long packs them instead, at the cost of at most this much extra latency;
+   * a full packet goes out at once. */
+  static const uint16_t StreamFlushUs = 2000;
 #endif
 
   bool handle_out(uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
@@ -294,6 +315,15 @@ private:
   uint8_t _stream_head; /* poll()-only producer index */
   uint8_t _stream_tail; /* poll()-only consumer index */
   uint8_t _stream_tx_failures; /* poll()-only: consecutive FAILED writes */
+  /* poll()-only: the bulk packet being assembled out of whole ring records
+   * (stream_poll()). Records move here from the ring as soon as they fit, so
+   * a packet the transport keeps refusing (BUSY) goes on filling up until it
+   * is sent. */
+  uint8_t _stream_packet[USBIO_STREAM_PACKET_MAX_LEN];
+  uint16_t _stream_packet_len;    /* bytes in _stream_packet */
+  uint8_t _stream_packet_records; /* whole records in _stream_packet */
+  uint8_t _stream_record_len;     /* length of the last record packed */
+  uint32_t _stream_packet_since_us; /* micros() when its first record went in */
 #endif
 
   uint8_t _reply[USBIO_MAX_REPLY_LEN];

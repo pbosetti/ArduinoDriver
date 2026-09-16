@@ -408,6 +408,12 @@ Stream Device::start_stream(StreamConfig config) {
   }
 
   std::lock_guard<std::mutex> lock(_stream->mutex);
+  // A host session that ended without STREAM_STOP (a crashed or killed
+  // process) leaves the device sampling, and STREAM_SELECT is refused with
+  // BUSY while it does: stop it first (STREAM_STOP is always accepted).
+  if (read_stream_status().running) {
+    send_out(Request::StreamStop, 0, 0);
+  }
   // STREAM_STOP keeps the selection: drop pins an earlier stream on this
   // Device selected but the new configuration does not want.
   for (const std::uint8_t pin : _stream->selected) {
@@ -422,11 +428,48 @@ Stream Device::start_stream(StreamConfig config) {
     }
   }
   std::vector<std::uint8_t> added;
+  std::uint32_t start_t_us = 0;
   try {
     for (const std::uint8_t pin : config.pins) {
       send_out(Request::StreamSelect, 1, pin);
       added.push_back(pin);
     }
+    // The loop above only undoes this Device's own earlier selection, but the
+    // device keeps its selection across STREAM_STOP and across host sessions:
+    // pins another Device (e.g. a previous process) selected are still there,
+    // and every record would then carry more samples than config.pins and
+    // never decode. Trust the device's own count, and when it disagrees,
+    // deselect every other pin (removing an unselected pin is a no-op).
+    if (read_stream_status().n_channels != config.pins.size()) {
+      for (std::size_t p = 0; p < pin_count(); ++p) {
+        const auto pin = static_cast<std::uint8_t>(p);
+        if (std::find(config.pins.begin(), config.pins.end(), pin) !=
+            config.pins.end()) {
+          continue;
+        }
+        try {
+          send_out(Request::StreamSelect, 0, pin);
+        } catch (const Error &) {
+          // BAD_MODE: the pin is not in a streamable mode, so it cannot be
+          // (still) selected unless its mode changed after selection - the
+          // re-check below reports that case
+        }
+      }
+      const std::uint8_t n_channels = read_stream_status().n_channels;
+      if (n_channels != config.pins.size()) {
+        throw ProtocolError(fmt::format(
+            "start_stream: the device still reports {} selected channels "
+            "instead of {} after clearing a stale selection; a pin changed "
+            "mode while selected - reset() the device",
+            n_channels, config.pins.size()));
+      }
+    }
+    // Device clock just before STREAM_START: every record of the new stream
+    // is sampled after it, which is how Stream tells leftovers of an earlier
+    // session (still waiting in the bulk endpoint) from its own records.
+    std::array<std::byte, TimeReplyLen> time_reply{};
+    read_in(Request::GetTime, 0, time_reply, TimeReplyLen);
+    start_t_us = decode_time_reply(time_reply).micros;
     send_out(Request::StreamStart, period_us, config.flags);
   } catch (...) {
     for (auto it = added.rbegin(); it != added.rend(); ++it) {
@@ -440,11 +483,15 @@ Stream Device::start_stream(StreamConfig config) {
   }
   _stream->selected = config.pins;
   _stream->streaming.store(true, std::memory_order_release);
-  return Stream(*this, std::move(config));
+  return Stream(*this, std::move(config), start_t_us);
 }
 
 StreamStatus Device::poll_stream_status() {
   std::lock_guard<std::mutex> lock(_stream->mutex);
+  return read_stream_status();
+}
+
+StreamStatus Device::read_stream_status() {
   std::array<std::byte, StreamStatusLen> reply{};
   const std::size_t n = raw_in(Request::StreamStatus, 0, reply);
   if (n < StreamStatusLen) {

@@ -282,7 +282,7 @@ t_us,pin,volts
 1044216,15,0.4150
 …
 stream: 3029 records (6058 samples) in 3.028 s (1000.4 Hz achieved per channel);
-device overruns 0, seq gaps 0, host drops 0, resyncs 0
+device overruns 0, seq gaps 0, host drops 0, resyncs 0, stale records 0
 ```
 
 One row per sample (`t_us,pin,raw`, or `volts` with `--volts`); samples from
@@ -299,7 +299,9 @@ while (running) {
   const std::size_t n = s.read(buf, std::chrono::milliseconds(100));
   for (std::size_t i = 0; i < n; ++i) use(buf[i].pin, buf[i].volts, buf[i].t_us);
 }
-// s.stats(): records_received, device_overruns, seq_gaps, host_drops, resyncs
+// s.stats(): records_received, device_overruns, seq_gaps, host_drops, resyncs,
+//            stale_records
+// s.running() turns false if the stream dies on its own; s.error() says why
 // the destructor stops the device stream and joins the worker
 ```
 
@@ -312,10 +314,30 @@ resyncs separately. While a stream runs the `Device` refuses other calls with
 `DeviceBusy`; `RESET`, a `pin_mode()` on a selected pin, and unplugging all
 stop it.
 
-Measured on a Portenta H7: 2 channels at 1 kHz for 3 s, 3029 records, zero
-overruns, gaps, drops or resyncs. The ceiling has not been measured yet — the
-firmware samples at most one record per `poll()` call, so the practical limit
-is the sketch's loop rate rather than the bus.
+On the wire, the firmware packs whole records into each bulk packet (up to
+511 bytes on a High Speed board, 63 on Full Speed) and sends a partly filled
+packet at the latest 2 ms after its first record: at 10 kHz with two channels
+that is ~500 transfers per second instead of 10 000, for at most 2 ms of added
+latency. The host side is robust to what a real session leaves behind:
+
+- `start_stream()` checks the device's own channel count and clears pins that
+  an earlier session (another process, say) left selected; `STREAM_STOP`
+  keeps the selection on the device.
+- Records still waiting in the endpoint from an earlier session are
+  recognised by their timestamp (older than the device clock read just before
+  `STREAM_START`) and dropped, counted in `stale_records`.
+- `start_stream()` also stops a stream that a session which never sent
+  `STREAM_STOP` (a killed process) left running on the device.
+- A failed bulk transfer ends the stream: `running()` turns false and
+  `error()` says why, and `arduino-io stream` exits early printing the reason.
+  Opening the device again starts a clean session.
+
+Measured on a Portenta H7 behind a powered USB hub: 2 channels at 10 kHz,
+10 runs of 60 s, about 6 million records, no transfer failures, device
+overruns between 0.01 % and 0.17 % per run. The firmware samples at most one
+record per `poll()` call, so the ceiling is the sketch's loop rate; see
+[High Speed link quality](#high-speed-link-quality) if streams die with
+`LIBUSB_ERROR_IO`.
 
 ## Pin events and device time
 
@@ -434,6 +456,20 @@ Nano RP2040 Connect D24–D29) they are addressable, exactly as a sketch could
    when it is released. Without `--debounce` a bouncing contact can report
    several edges per press: the scan only filters bounce shorter than one
    `loop()` iteration.
+
+### High Speed link quality
+
+The Portenta H7 enumerates at USB High Speed (480 Mbit/s), and its bulk
+endpoint is only as reliable as the link. Plugged straight into a Mac's USB-C
+port (two different cables tried), streams died every few seconds with
+`bulk IN transfer failed: LIBUSB_ERROR_IO` — `device not responding`
+(`0xe00002ed`) in libusb's warning log (`LIBUSB_DEBUG=2`) — and now and then
+the board stopped answering control requests altogether until it was
+replugged, while the sketch itself kept running. Failures scaled with the
+number of bytes per packet, not with time or firmware activity: bit errors on
+the link. The same board and firmware behind a **powered USB hub** ran
+10 x 60 s at 10 kHz without a single failure. If you see these symptoms, put
+a powered hub between the computer and the board, and prefer a short cable.
 
 ## Limitations and follow-ups
 

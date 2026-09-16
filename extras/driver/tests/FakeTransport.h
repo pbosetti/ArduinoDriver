@@ -235,6 +235,10 @@ public:
   /// script a whole sequence of calls; once exhausted, bulk_in() goes back
   /// to draining as much of the queue as fits the caller's buffer.
   void queue_bulk_chunk(std::size_t n);
+  /// Makes the next bulk_in() call throw UsbError with this libusb error code
+  /// (a LibusbError constant), like LibusbTransport does when a bulk IN
+  /// transfer fails. One-shot (guarded).
+  void fail_bulk_in(int usb_error_code);
   /// Bytes still queued and not yet served by bulk_in() (guarded).
   std::size_t bulk_queue_size() const noexcept;
 
@@ -334,6 +338,7 @@ private:
   std::uint8_t _event_dropped{0};         ///< saturating; cleared by EVENT_POP
   std::deque<std::byte> _bulk_queue;
   std::deque<std::size_t> _bulk_chunks;
+  std::optional<int> _bulk_failure; ///< fail_bulk_in(), consumed by bulk_in()
   std::uint16_t _ramp_start{0};
   std::uint16_t _ramp_step{0};
   std::uint32_t _ramp_t0_us{0};

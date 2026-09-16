@@ -810,6 +810,13 @@ std::size_t FakeTransport::bulk_in(std::span<std::byte> data,
         "FakeTransport: board has no bulk IN endpoint (no USBIO_FLAG_STREAMING)");
   }
   std::unique_lock<std::mutex> lock(_mutex);
+  if (_bulk_failure) {
+    const int code = *_bulk_failure;
+    _bulk_failure.reset();
+    throw UsbError("FakeTransport: injected bulk IN transfer failure: " +
+                       std::string(usb_error_name(code)),
+                   code);
+  }
   if (_bulk_queue.empty() && _bulk_chunks.empty()) {
     // Idle: behave like a real endpoint with nothing to deliver. A Stream's
     // worker calls this in a tight loop, so wait a little (not the full
@@ -828,6 +835,11 @@ std::size_t FakeTransport::bulk_in(std::span<std::byte> data,
   _bulk_queue.erase(_bulk_queue.begin(),
                     _bulk_queue.begin() + static_cast<std::ptrdiff_t>(n));
   return n;
+}
+
+void FakeTransport::fail_bulk_in(int usb_error_code) {
+  std::lock_guard<std::mutex> lock(_mutex);
+  _bulk_failure = usb_error_code;
 }
 
 void FakeTransport::set_stream_ramp(std::uint16_t start, std::uint16_t step,

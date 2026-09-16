@@ -34,6 +34,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ArduinoDriver {
@@ -83,6 +84,10 @@ struct StreamStats {
                                 ///< (StreamConfig::queue_capacity exceeded)
   std::uint64_t resyncs{0};     ///< times the byte stream lost sync on
                                 ///< USBIO_STREAM_MAGIC and had to resync
+  std::uint64_t stale_records{0}; ///< records sampled before this stream's
+                                  ///< STREAM_START - left over in the
+                                  ///< device's endpoint by an earlier
+                                  ///< session - and discarded
 };
 
 /// RAII bulk-streaming session. Move-only; the destructor stops the device
@@ -116,8 +121,15 @@ public:
   /// thread at any time.
   StreamStats stats() const;
 
-  /// True until stop() has completed (or the destructor has run).
+  /// True until stop() has completed (or the destructor has run), or until
+  /// the worker stopped on its own after a transport failure (see error()).
   bool running() const noexcept;
+
+  /// Why the worker stopped on its own: the message of the transport error
+  /// that ended the stream (e.g. a failed bulk IN transfer, or the device
+  /// being unplugged). Empty while the stream runs normally and after a
+  /// regular stop(). Safe to call from any thread at any time.
+  std::string error() const;
 
   /// Pins in selection order, as given to Device::start_stream().
   const std::vector<std::uint8_t> &pins() const noexcept;
@@ -129,7 +141,9 @@ public:
 
 private:
   friend class Device;
-  Stream(Device &device, StreamConfig config);
+  /// `start_t_us`: device micros() read just before STREAM_START; records
+  /// sampled earlier are stale (see StreamStats::stale_records).
+  Stream(Device &device, StreamConfig config, std::uint32_t start_t_us);
 
   // Trampolines through which Impl (a nested class: it has the same access
   // to Stream's own members as Stream itself, but does not inherit Stream's

@@ -298,6 +298,9 @@ private:
   /// GET_STREAM_STATUS, for Stream's worker to refresh its stats(). Callable
   /// only while a stream is running; serialised against end_stream().
   StreamStatus poll_stream_status();
+  /// GET_STREAM_STATUS without taking StreamState::mutex: the body of
+  /// poll_stream_status(), for start_stream(), which already holds it.
+  StreamStatus read_stream_status();
   /// STREAM_STOP (best effort: errors are swallowed) and clears the
   /// streaming flag. Called by Stream::stop() / its destructor; never
   /// throws, safe to call more than once.

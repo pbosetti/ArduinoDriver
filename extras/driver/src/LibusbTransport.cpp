@@ -350,6 +350,12 @@ private:
       submit(buf); // keep the endpoint continuously armed
       return;
     }
+    // A failed transfer is fatal for the ring. Do not try to recover it in
+    // place with libusb_clear_halt(): the CLEAR_FEATURE(ENDPOINT_HALT) it
+    // sends makes mbed's USBDevice abort the device's pending write, and on
+    // the STM32 PHY an abort closes the endpoint (HAL_PCD_EP_Close), so the
+    // device stops answering the endpoint until it is re-enumerated. A new
+    // host session (reopening the device) recovers from a failed transfer.
     if (buf.transfer->status != LIBUSB_TRANSFER_CANCELLED && !_fatal_error) {
       _fatal_error = transfer_status_error(buf.transfer->status);
     }

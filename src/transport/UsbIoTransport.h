@@ -43,11 +43,24 @@ enum usbio_stream_write_result {
 };
 
 /*
- * Non-blocking write of one stream record (usbio_stream_header_t + samples
- * [+ digital bitmap], see usbio_protocol.h "Record format") to the bulk IN
- * endpoint. `len` never exceeds USBIO_STREAM_EP_SIZE - the protocol's channel
- * and pin-count limits guarantee a record always fits in one packet, so a
- * transport never has to split one across calls.
+ * Largest payload usbio_transport_stream_write() accepts in one call: the
+ * bulk IN endpoint's wMaxPacketSize minus one byte. The core packs as many
+ * whole records as fit into each packet (UsbIo.cpp, stream_poll()), and
+ * keeping every packet one byte short of wMaxPacketSize makes it a short
+ * packet, which completes the host's pending bulk read immediately; a
+ * completely full packet followed by a pause in the stream would instead sit
+ * in the host's transfer until the next packet arrived. Never larger than
+ * USBIO_STREAM_PACKET_MAX_LEN (UsbIo.h), the size of the core's packet buffer.
+ */
+uint16_t usbio_transport_stream_packet_max();
+
+/*
+ * Non-blocking write of one bulk packet carrying one or more whole stream
+ * records (usbio_stream_header_t + samples [+ digital bitmap], see
+ * usbio_protocol.h "Record format") to the bulk IN endpoint. `len` never
+ * exceeds usbio_transport_stream_packet_max() - the protocol's channel and
+ * pin-count limits guarantee a single record always fits, so a transport
+ * never has to split one across calls.
  *
  * Called ONLY from UsbIoDevice::poll() (loop() context), never from the setup
  * callback. On USBIO_STREAM_WRITE_SENT the caller may reuse `data` immediately

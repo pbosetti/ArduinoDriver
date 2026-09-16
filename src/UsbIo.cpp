@@ -73,7 +73,9 @@ UsbIoDevice::UsbIoDevice()
       _stream_n_channels(0), _stream_running(0), _stream_flags(0),
       _stream_period_us(0), _stream_seq(0), _stream_overruns(0),
       _stream_start_requests(0), _stream_start_done(0), _stream_deadline_us(0),
-      _stream_head(0), _stream_tail(0), _stream_tx_failures(0)
+      _stream_head(0), _stream_tail(0), _stream_tx_failures(0),
+      _stream_packet_len(0), _stream_packet_records(0), _stream_record_len(0),
+      _stream_packet_since_us(0)
 #endif
 {
   for (unsigned p = 0; p < USBIO_MAX_PINS; ++p) {
@@ -89,6 +91,7 @@ UsbIoDevice::UsbIoDevice()
 #if USBIO_HAS_STREAM_TRANSPORT
   memset(_stream_channels, 0, sizeof(_stream_channels));
   memset(_stream_ring, 0, sizeof(_stream_ring));
+  memset(_stream_packet, 0, sizeof(_stream_packet));
 #endif
 }
 
@@ -1022,6 +1025,9 @@ void UsbIoDevice::stream_poll() {
     _stream_seq = 0;
     _stream_overruns = 0;
     _stream_tx_failures = 0;
+    _stream_packet_len = 0;
+    _stream_packet_records = 0;
+    _stream_record_len = 0;
     _stream_deadline_us = micros();
   }
   if (_stream_running) {
@@ -1037,33 +1043,71 @@ void UsbIoDevice::stream_poll() {
   }
   /* Drain whatever the ring holds - not just what was just sampled - so a
    * backlog left over from a busy transport keeps draining even on a poll()
-   * call that samples nothing (period not yet due, or the stream stopped). */
+   * call that samples nothing (period not yet due, or the stream stopped).
+   * Whole records are packed into one bulk packet of at most
+   * usbio_transport_stream_packet_max() bytes and handed over in a single
+   * write: at high rates this turns thousands of one-record transfers per
+   * second into a few hundred packed ones. Each record is copied once, from
+   * the ring into _stream_packet, as soon as it fits, so while the transport
+   * answers BUSY the pending packet keeps filling up instead of being
+   * rebuilt on every poll(). */
+  const uint16_t packet_max = usbio_transport_stream_packet_max();
   while (_stream_tail != _stream_head) {
     const StreamRecord &rec =
         _stream_ring[_stream_tail & (uint8_t)(StreamRingDepth - 1u)];
-    const uint8_t result = usbio_transport_stream_write(rec.data, rec.len);
-    if (result == USBIO_STREAM_WRITE_BUSY) {
-      break; /* previous packet still in flight; retry next poll() */
+    if ((uint16_t)(_stream_packet_len + rec.len) > packet_max) {
+      break; /* packet full: the rest waits in the ring for the next one */
     }
-    if (result == USBIO_STREAM_WRITE_FAILED) {
-      /* The host is not draining the endpoint. Give it StreamTxFailureLimit
-       * tries, then stop the stream and drop the backlog: leaving records
-       * queued would keep the drain loop above paying the transport's send
-       * timeout on every poll() for as long as the sketch runs. The dropped
-       * records are counted as overruns, and GET_STREAM_STATUS then reports
-       * running == 0, so a host that comes back sees exactly what happened. */
-      if (++_stream_tx_failures < StreamTxFailureLimit) {
-        break;
-      }
-      _stream_running = 0;
-      _stream_overruns += (uint8_t)(_stream_head - _stream_tail);
-      _stream_tail = _stream_head;
-      _stream_tx_failures = 0;
-      break;
+    if (_stream_packet_len == 0) {
+      _stream_packet_since_us = micros();
     }
-    _stream_tx_failures = 0;
+    memcpy(_stream_packet + _stream_packet_len, rec.data, rec.len);
+    _stream_packet_len = (uint16_t)(_stream_packet_len + rec.len);
+    _stream_record_len = rec.len;
+    ++_stream_packet_records;
     _stream_tail = (uint8_t)(_stream_tail + 1u);
   }
+  if (_stream_packet_len == 0) {
+    return;
+  }
+  /* Hold a partly filled packet back (StreamFlushUs, UsbIo.h) so that records
+   * travel together; send it once another record would not fit, once its
+   * first record has waited StreamFlushUs, or as soon as the stream has
+   * stopped, so the last records of a stream are not held back. */
+  const bool full =
+      (uint16_t)(packet_max - _stream_packet_len) < _stream_record_len;
+  if (!full && _stream_running &&
+      (uint32_t)(micros() - _stream_packet_since_us) < StreamFlushUs) {
+    return;
+  }
+  const uint8_t result =
+      usbio_transport_stream_write(_stream_packet, _stream_packet_len);
+  if (result == USBIO_STREAM_WRITE_BUSY) {
+    return; /* previous packet still in flight; retry next poll() */
+  }
+  if (result == USBIO_STREAM_WRITE_FAILED) {
+    /* The host is not draining the endpoint. Give it StreamTxFailureLimit
+     * tries, then stop the stream and drop the backlog: leaving records
+     * queued would keep the drain above paying the transport's send timeout
+     * on every poll() for as long as the sketch runs. The dropped records -
+     * the pending packet's and the ring's - are counted as overruns, and
+     * GET_STREAM_STATUS then reports running == 0, so a host that comes back
+     * sees exactly what happened. */
+    if (++_stream_tx_failures < StreamTxFailureLimit) {
+      return;
+    }
+    _stream_running = 0;
+    _stream_overruns += _stream_packet_records;
+    _stream_overruns += (uint8_t)(_stream_head - _stream_tail);
+    _stream_tail = _stream_head;
+    _stream_packet_len = 0;
+    _stream_packet_records = 0;
+    _stream_tx_failures = 0;
+    return;
+  }
+  _stream_tx_failures = 0;
+  _stream_packet_len = 0;
+  _stream_packet_records = 0;
 }
 
 void UsbIoDevice::stream_sample(uint32_t now) {

@@ -44,10 +44,10 @@ void Stream::end(Device &device) noexcept { device.end_stream(); }
 // ---- Impl ---------------------------------------------------------------
 
 struct Stream::Impl {
-  Impl(Device &dev, StreamConfig cfg)
+  Impl(Device &dev, StreamConfig cfg, std::uint32_t start_us)
       : device(dev), transport(dev.transport()), config(std::move(cfg)),
-        n_pins(dev.pin_count()), digital(StreamFlags{config.flags}.digital()) {
-  }
+        n_pins(dev.pin_count()), digital(StreamFlags{config.flags}.digital()),
+        start_t_us(start_us) {}
 
   void worker_main();
   void deliver(std::vector<Sample> samples);
@@ -57,17 +57,19 @@ struct Stream::Impl {
   StreamConfig config;
   std::size_t n_pins;
   bool digital;
+  std::uint32_t start_t_us; // device micros() just before STREAM_START
 
   std::thread worker;
   std::atomic<bool> stop_requested{false};
   std::atomic<bool> running{true};
   std::once_flag stop_once;
 
-  mutable std::mutex mutex; // guards ready, stats, callback below
+  mutable std::mutex mutex; // guards ready, stats, callback, error below
   std::condition_variable cv;
   std::deque<std::vector<Sample>> ready;
   StreamStats stats;
   RecordCallback callback;
+  std::string error; // why the worker stopped on its own; empty otherwise
 };
 
 void Stream::Impl::deliver(std::vector<Sample> samples) {
@@ -103,8 +105,11 @@ void Stream::Impl::worker_main() {
     std::size_t n = 0;
     try {
       n = transport.bulk_in(chunk, IoTimeout);
-    } catch (const Error &) {
-      break; // fatal transport failure (e.g. device unplugged): stop
+    } catch (const Error &e) {
+      // fatal transport failure (e.g. device unplugged): record why, stop
+      std::lock_guard<std::mutex> lock(mutex);
+      error = e.what();
+      break;
     }
     if (n > 0) {
       buffer.insert(buffer.end(), chunk.begin(),
@@ -131,6 +136,20 @@ void Stream::Impl::worker_main() {
         ++stats.resyncs;
         hunting = false;
       }
+      // STREAM_STOP leaves whatever the device had already handed to its
+      // bulk endpoint there, so the first bytes a new session reads can be
+      // records of an earlier one. Every record of this stream was sampled
+      // after start_t_us (read just before STREAM_START): anything older,
+      // modulo micros()' 2^32 wrap, is stale.
+      const std::uint32_t age = start_t_us - header.t_us;
+      if (age != 0 && age < 0x80000000u) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          ++stats.stale_records;
+        }
+        pos += record_len;
+        continue;
+      }
 
       std::vector<Sample> samples(header.n_samples);
       for (std::uint16_t i = 0; i < header.n_samples; ++i) {
@@ -145,8 +164,11 @@ void Stream::Impl::worker_main() {
         std::lock_guard<std::mutex> lock(mutex);
         if (last_seq) {
           const auto expected = static_cast<std::uint32_t>(*last_seq + 1);
-          if (header.seq != expected) {
-            stats.seq_gaps += static_cast<std::uint64_t>(header.seq - expected);
+          const std::uint32_t gap = header.seq - expected;
+          // A backwards jump (gap >= 2^31 once wrapped) means the device
+          // restarted its seq counter, not that ~4 billion records were lost.
+          if (gap != 0 && gap < 0x80000000u) {
+            stats.seq_gaps += gap;
           }
         }
         last_seq = header.seq;
@@ -177,8 +199,8 @@ void Stream::Impl::worker_main() {
 
 // ---- Stream ---------------------------------------------------------------
 
-Stream::Stream(Device &device, StreamConfig config)
-    : _impl(std::make_unique<Impl>(device, std::move(config))) {
+Stream::Stream(Device &device, StreamConfig config, std::uint32_t start_t_us)
+    : _impl(std::make_unique<Impl>(device, std::move(config), start_t_us)) {
   Impl *impl = _impl.get();
   _impl->worker = std::thread([impl] { impl->worker_main(); });
 }
@@ -251,6 +273,14 @@ StreamStats Stream::stats() const {
   }
   std::lock_guard<std::mutex> lock(_impl->mutex);
   return _impl->stats;
+}
+
+std::string Stream::error() const {
+  if (!_impl) {
+    return {};
+  }
+  std::lock_guard<std::mutex> lock(_impl->mutex);
+  return _impl->error;
 }
 
 bool Stream::running() const noexcept {

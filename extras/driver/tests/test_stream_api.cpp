@@ -9,11 +9,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
 using namespace ArduinoDriver;
 using ArduinoDriver::Testing::FakeBoard;
+using ArduinoDriver::Testing::FakeTransport;
 using ArduinoDriver::Testing::fast_options;
 using ArduinoDriver::Testing::Rig;
 
@@ -50,16 +52,24 @@ TEST_CASE("start_stream selects the pins in order and starts the device",
   CHECK(stream.running());
   CHECK(stream.pins() == std::vector<std::uint8_t>{19, 20});
 
-  // STREAM_SELECT once per pin (in order), then STREAM_START.
-  REQUIRE(rig.fake.log().size() == 3);
-  CHECK(rig.fake.log()[0].request == USBIO_REQ_STREAM_SELECT);
-  CHECK(rig.fake.log()[0].index == 19);
-  CHECK(rig.fake.log()[0].value == 1);
-  CHECK(rig.fake.log()[1].request == USBIO_REQ_STREAM_SELECT);
-  CHECK(rig.fake.log()[1].index == 20);
-  CHECK(rig.fake.log()[1].value == 1);
-  CHECK(rig.fake.log()[2].request == USBIO_REQ_STREAM_START);
-  CHECK(rig.fake.log()[2].value == 1000);
+  // GET_STREAM_STATUS (is a stream left running?), STREAM_SELECT once per
+  // pin (in order), GET_STREAM_STATUS to confirm the device's channel count
+  // matches, GET_TIME to anchor stale-record detection, then STREAM_START.
+  // (The worker's own status polls may follow, so only the first six
+  // requests are checked.)
+  const auto log = rig.fake.log();
+  REQUIRE(log.size() >= 6);
+  CHECK(log[0].request == USBIO_REQ_STREAM_STATUS);
+  CHECK(log[1].request == USBIO_REQ_STREAM_SELECT);
+  CHECK(log[1].index == 19);
+  CHECK(log[1].value == 1);
+  CHECK(log[2].request == USBIO_REQ_STREAM_SELECT);
+  CHECK(log[2].index == 20);
+  CHECK(log[2].value == 1);
+  CHECK(log[3].request == USBIO_REQ_STREAM_STATUS);
+  CHECK(log[4].request == USBIO_REQ_GET_TIME);
+  CHECK(log[5].request == USBIO_REQ_STREAM_START);
+  CHECK(log[5].value == 1000);
 
   stream.stop();
   CHECK_FALSE(rig.fake.stream_running());
@@ -87,6 +97,59 @@ TEST_CASE("a second start_stream() replaces the pin selection", "[stream][api]")
   // 19 and 20 are deselected (no longer wanted), 0 is added.
   CHECK(rig.fake.stream_selected() == std::vector<std::uint8_t>{0});
   s2.stop();
+}
+
+TEST_CASE("start_stream clears a stale selection left by another session",
+          "[stream][api]") {
+  // One device, two host sessions: the selection survives STREAM_STOP on the
+  // device, and the second Device has no record of what the first selected.
+  FakeTransport fake(streaming_board());
+  auto borrowed = [&fake] {
+    return std::make_unique<ArduinoDriver::Testing::BorrowedTransport>(fake);
+  };
+  {
+    Device first(borrowed(), fast_options());
+    first.pin_mode(19, PinMode::AnalogIn);
+    first.pin_mode(20, PinMode::AnalogIn);
+    first.pin_mode(0, PinMode::Input);
+    StreamConfig config;
+    config.pins = {0, 19};
+    Stream s = first.start_stream(config);
+    s.stop();
+  }
+  REQUIRE(fake.stream_selected() == std::vector<std::uint8_t>{0, 19});
+
+  Device second(borrowed(), fast_options());
+  StreamConfig config;
+  config.pins = {20};
+  Stream s = second.start_stream(config);
+  CHECK(fake.stream_selected() == std::vector<std::uint8_t>{20});
+  CHECK(fake.stream_running());
+  s.stop();
+}
+
+TEST_CASE("start_stream stops a stream an ended session left running",
+          "[stream][api]") {
+  // A process killed mid-stream never sends STREAM_STOP: the device keeps
+  // sampling, and would refuse the next session's STREAM_SELECT with BUSY.
+  FakeTransport fake(streaming_board());
+  auto borrowed = [&fake] {
+    return std::make_unique<ArduinoDriver::Testing::BorrowedTransport>(fake);
+  };
+  Device device(borrowed(), fast_options());
+  device.pin_mode(19, PinMode::AnalogIn);
+  device.pin_mode(20, PinMode::AnalogIn);
+  fake.control_out(USBIO_REQ_STREAM_SELECT, 1, 19, 100ms);
+  fake.control_out(USBIO_REQ_STREAM_START, 0, 0, 100ms);
+  REQUIRE(fake.stream_running());
+
+  StreamConfig config;
+  config.pins = {20};
+  Stream s = device.start_stream(config);
+  CHECK(fake.count(Request::StreamStop) == 1);
+  CHECK(fake.stream_selected() == std::vector<std::uint8_t>{20});
+  CHECK(fake.stream_running());
+  s.stop();
 }
 
 // ---- Validation -----------------------------------------------------------

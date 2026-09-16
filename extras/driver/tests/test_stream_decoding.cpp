@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -59,6 +60,22 @@ void wait_for_host_drops(Stream &stream, std::uint64_t want) {
     std::this_thread::sleep_for(1ms);
   }
   REQUIRE(stream.stats().host_drops == want);
+}
+
+/// One hand-built single-channel record (header + one sample), for edge cases
+/// the ramp generator cannot produce (chosen seq and t_us values).
+std::vector<std::byte> single_channel_record(std::uint32_t seq,
+                                             std::uint32_t t_us,
+                                             std::uint16_t raw) {
+  std::vector<std::byte> bytes(stream_record_len(1, false, 0));
+  StreamHeader header;
+  header.magic = StreamMagic;
+  header.n_samples = 1;
+  header.seq = seq;
+  header.t_us = t_us;
+  encode_stream_header(bytes, header);
+  write_u16le(bytes, StreamHeaderLen, raw);
+  return bytes;
 }
 
 } // namespace
@@ -221,6 +238,102 @@ TEST_CASE("Stream drops the oldest records beyond queue_capacity",
   const StreamStats stats2 = stream.stats();
   CHECK(stats2.records_received == 5);
   CHECK(stats2.host_drops == 3);
+}
+
+TEST_CASE("Stream discards records sampled before its STREAM_START",
+          "[stream][decoding]") {
+  Rig rig(streaming_board(), fast_options());
+  rig.device.pin_mode(15, PinMode::AnalogIn);
+  StreamConfig config;
+  config.pins = {15};
+
+  SECTION("leftovers of an earlier session") {
+    rig.fake.set_micros(10000); // start_stream() reads this before START
+    Stream stream = rig.device.start_stream(config);
+    for (const auto &rec : {single_channel_record(40, 8000, 1),
+                            single_channel_record(41, 9000, 2),
+                            single_channel_record(0, 10500, 3),
+                            single_channel_record(1, 11000, 4)}) {
+      rig.fake.queue_bulk_bytes(rec);
+    }
+    const std::vector<Sample> samples = drain(stream, 2);
+    CHECK(samples[0].raw == 3);
+    CHECK(samples[0].t_us == 10500);
+    CHECK(samples[1].raw == 4);
+    const StreamStats stats = stream.stats();
+    CHECK(stats.stale_records == 2);
+    CHECK(stats.records_received == 2);
+    CHECK(stats.seq_gaps == 0);
+  }
+  SECTION("across micros()' 2^32 wrap") {
+    rig.fake.set_micros(0xFFFFFF00u);
+    Stream stream = rig.device.start_stream(config);
+    rig.fake.queue_bulk_bytes(single_channel_record(7, 0xFFFFFE00u, 1)); // stale
+    rig.fake.queue_bulk_bytes(single_channel_record(0, 0xFFFFFF80u, 2));
+    rig.fake.queue_bulk_bytes(single_channel_record(1, 0x00000010u, 3)); // wrapped
+    const std::vector<Sample> samples = drain(stream, 2);
+    CHECK(samples[0].raw == 2);
+    CHECK(samples[1].raw == 3);
+    CHECK(stream.stats().stale_records == 1);
+  }
+}
+
+TEST_CASE("a backwards seq jump is a device restart, not a gap",
+          "[stream][decoding]") {
+  Rig rig(streaming_board(), fast_options());
+  rig.device.pin_mode(15, PinMode::AnalogIn);
+  StreamConfig config;
+  config.pins = {15};
+  Stream stream = rig.device.start_stream(config); // start_t_us == 0
+  for (const auto &rec : {single_channel_record(5, 100, 1),
+                          single_channel_record(6, 200, 2),
+                          single_channel_record(0, 300, 3),
+                          single_channel_record(1, 400, 4)}) {
+    rig.fake.queue_bulk_bytes(rec);
+  }
+  drain(stream, 4);
+  const StreamStats stats = stream.stats();
+  CHECK(stats.records_received == 4);
+  CHECK(stats.seq_gaps == 0);
+}
+
+TEST_CASE("Stream stops and reports why when bulk_in() fails",
+          "[stream][decoding]") {
+  Rig rig(streaming_board(), fast_options());
+  rig.device.pin_mode(15, PinMode::AnalogIn);
+  StreamConfig config;
+  config.pins = {15};
+  Stream stream = rig.device.start_stream(config);
+
+  rig.fake.set_stream_ramp(/*start=*/100, /*step=*/10, /*t0_us=*/1000,
+                           /*dt_us=*/500);
+  rig.fake.queue_stream_records(2);
+  drain(stream, 2);
+  CHECK(stream.running());
+  CHECK(stream.error().empty());
+
+  rig.fake.fail_bulk_in(LibusbError::Pipe);
+  for (int attempt = 0; attempt < 500 && stream.running(); ++attempt) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE_FALSE(stream.running());
+  CHECK(stream.error().find("LIBUSB_ERROR_PIPE") != std::string::npos);
+
+  // stop() after the worker died on its own is still safe and keeps the
+  // reason available.
+  stream.stop();
+  CHECK(stream.error().find("LIBUSB_ERROR_PIPE") != std::string::npos);
+}
+
+TEST_CASE("a regular stop() leaves Stream::error() empty", "[stream][decoding]") {
+  Rig rig(streaming_board(), fast_options());
+  rig.device.pin_mode(15, PinMode::AnalogIn);
+  StreamConfig config;
+  config.pins = {15};
+  Stream stream = rig.device.start_stream(config);
+  stream.stop();
+  CHECK_FALSE(stream.running());
+  CHECK(stream.error().empty());
 }
 
 TEST_CASE("Stream record framing accounts for the padded digital bitmap",

@@ -290,6 +290,10 @@ int cmd_info(Device &dev) {
         usb->interface_number() ? fmt::format("{}", *usb->interface_number())
                                 : "none",
         usb->interface_claimed() ? " (claimed)" : "");
+    if (usb->bulk_in_max_packet_size() > 0) {
+      fmt::print("stream endpoint:  wMaxPacketSize {} bytes\n",
+                 usb->bulk_in_max_packet_size());
+    }
   }
   return ExitOk;
 }
@@ -561,6 +565,9 @@ int cmd_stream(Device &dev, const std::vector<std::string> &args,
       break;
     }
     const std::size_t n = stream.read(batch, 200ms);
+    if (n == 0 && !stream.running()) {
+      break; // the worker died (transport failure): nothing more will come
+    }
     for (std::size_t i = 0; i < n; ++i) {
       const Sample &sample = batch[i];
       if (s.volts) {
@@ -584,10 +591,15 @@ int cmd_stream(Device &dev, const std::vector<std::string> &args,
   fmt::print(stderr,
             "stream: {} records ({} samples) in {:.3f} s ({:.1f} Hz achieved "
             "per channel); device overruns {}, seq gaps {}, host drops {}, "
-            "resyncs {}\n",
+            "resyncs {}, stale records {}\n",
             stats.records_received, total_samples, elapsed, rate,
             stats.device_overruns, stats.seq_gaps, stats.host_drops,
-            stats.resyncs);
+            stats.resyncs, stats.stale_records);
+  if (const std::string error = stream.error(); !error.empty()) {
+    fmt::print(stderr, "stream: stopped early after {:.3f} s: {}\n", elapsed,
+               error);
+    return ExitDevice;
+  }
   return ExitOk;
 }
 

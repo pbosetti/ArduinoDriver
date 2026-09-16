@@ -37,6 +37,22 @@
 
 namespace {
 
+/* Bulk IN wMaxPacketSize. USB 2.0 (5.8.3) fixes it at 512 for a High Speed
+ * bulk endpoint; 64 is only valid at Full Speed. Boards whose mbed target runs
+ * the STM32 OTG_HS core (Portenta H7: MBED_CONF_TARGET_USB_SPEED ==
+ * USE_USB_OTG_HS) enumerate at High Speed, and the core's own USB/USBCDC.h
+ * switches its bulk endpoints to 512 on exactly the same condition. Both
+ * macros are guarded: on a target that does not define them (nRF52, RP2040)
+ * an undefined identifier would otherwise evaluate to 0 == 0. */
+#if defined(MBED_CONF_TARGET_USB_SPEED) && defined(USE_USB_OTG_HS) &&          \
+    (MBED_CONF_TARGET_USB_SPEED == USE_USB_OTG_HS)
+const uint16_t StreamEpSize = 512u;
+#else
+const uint16_t StreamEpSize = USBIO_STREAM_EP_SIZE;
+#endif
+USBIO_STATIC_ASSERT(StreamEpSize - 1u <= USBIO_STREAM_PACKET_MAX_LEN,
+                    "the core's packet buffer must hold a full stream packet");
+
 class UsbIoMbedModule : public arduino::internal::PluggableUSBModule {
 public:
   UsbIoMbedModule()
@@ -44,16 +60,18 @@ public:
     PluggableUSBD().plug(this);
   }
 
-  /* Non-blocking write of one stream record; see UsbIoTransport.h. Called
-   * from poll() only.
+  /* Non-blocking write of one bulk packet of whole stream records; see
+   * UsbIoTransport.h. Called from poll() only.
    *
-   * The flag is raised BEFORE the transfer is armed: a 44-byte packet can
+   * The flag is raised BEFORE the transfer is armed: a short packet can
    * complete while this function is still running, and _stream_send_done()
    * (USB interrupt, higher priority than loop()) only ever lowers it. Arming
    * first would let that completion land between write_start() and the
    * assignment, leaving the flag raised with no transfer in flight and the
-   * stream stalled for good. USBCDC.cpp:377-404 avoids the same race with
-   * lock()/assert_locked(), which a PluggableUSBModule cannot take. */
+   * stream stalled for good. USBCDC.cpp:377-404 avoids the same race by
+   * holding lock() around the check and the arm; write_start() itself takes
+   * that lock (a critical section) internally, so the call is safe from
+   * loop() either way. */
   uint8_t stream_write(const uint8_t *data, uint16_t len) {
     if (_tx_in_progress || len > sizeof(_tx_buffer)) {
       return USBIO_STREAM_WRITE_BUSY;
@@ -99,8 +117,8 @@ protected:
         ENDPOINT_DESCRIPTOR,        // bDescriptorType
         _bulk_in,                   // bEndpointAddress
         E_BULK,                     // bmAttributes
-        LSB(USBIO_STREAM_EP_SIZE),  // wMaxPacketSize (LSB)
-        MSB(USBIO_STREAM_EP_SIZE),  // wMaxPacketSize (MSB)
+        LSB(StreamEpSize),          // wMaxPacketSize (LSB)
+        MSB(StreamEpSize),          // wMaxPacketSize (MSB)
         0x00,                       // bInterval
     };
     memcpy(_configuration_descriptor, desc, sizeof(desc));
@@ -159,7 +177,7 @@ protected:
    * own bulk/interrupt endpoints. */
   bool callback_set_configuration(uint8_t) override {
     PluggableUSBD().endpoint_add(
-        _bulk_in, USBIO_STREAM_EP_SIZE, USB_EP_TYPE_BULK,
+        _bulk_in, StreamEpSize, USB_EP_TYPE_BULK,
         ::mbed::callback(this, &UsbIoMbedModule::_stream_send_done));
     _tx_in_progress = false;
     return true;
@@ -176,7 +194,7 @@ protected:
     }
   }
   void init(EndpointResolver &resolver) override {
-    _bulk_in = resolver.endpoint_in(USB_EP_TYPE_BULK, USBIO_STREAM_EP_SIZE);
+    _bulk_in = resolver.endpoint_in(USB_EP_TYPE_BULK, StreamEpSize);
     MBED_ASSERT(resolver.valid());
   }
 
@@ -209,7 +227,7 @@ private:
 
   uint8_t _configuration_descriptor[DescriptorLength];
   usb_ep_t _bulk_in;
-  uint8_t _tx_buffer[USBIO_STREAM_EP_SIZE];
+  uint8_t _tx_buffer[StreamEpSize];
   /* Raised by stream_write() in loop() context, lowered by the completion
    * callback and callback_state_change() in interrupt context; volatile
    * because, unlike USBCDC's, these accesses are not serialised by lock(). */
@@ -223,6 +241,10 @@ UsbIoMbedModule module;
 
 uint16_t usbio_transport_begin() {
   return USBIO_FLAG_VENDOR_INTERFACE | USBIO_FLAG_STREAMING;
+}
+
+uint16_t usbio_transport_stream_packet_max() {
+  return (uint16_t)(StreamEpSize - 1u);
 }
 
 uint8_t usbio_transport_stream_write(const uint8_t *data, uint16_t len) {

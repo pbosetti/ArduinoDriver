@@ -14,9 +14,10 @@
  * all that is needed. setup() is called from the USB_Handler IRQ: ISR context.
  *
  * Streaming (usbio_protocol.h, "Streaming"): the interface also claims one
- * bulk IN endpoint, a lower tier than mbed's: one 64-byte record per poll()
- * call, ~64 kB/s at a fast loop(). PluggableUSBModule's ctor takes
- * numEndpoints + an epType table (api/PluggableUSB.h:29-33); plug()
+ * bulk IN endpoint, a lower tier than mbed's: one packet of whole records,
+ * at most 63 bytes (usbio_transport_stream_packet_max()), per poll() call.
+ * PluggableUSBModule's ctor takes numEndpoints + an epType table
+ * (api/PluggableUSB.h:29-33); plug()
  * (api/PluggableUSB.cpp:70-95) reserves the endpoint eagerly at that point -
  * unlike mbed, there is no separate resolver/configuration-callback step.
  * Sends use the core's own USBDeviceClass::send(), the same call CDC.cpp uses
@@ -53,8 +54,9 @@ public:
     PluggableUSB().plug(this);
   }
 
-  /* Write of one stream record; see UsbIoTransport.h. Called from poll() only
-   * - see the class comment above for why this particular call can block.
+  /* Write of one packet of whole stream records; see UsbIoTransport.h.
+   * Called from poll() only - see the class comment above for why this
+   * particular call can block.
    * send() has no "busy, try later" state: it either gets the packet out or
    * has already burned its 70 ms timeout waiting for a host that is not
    * draining, so a short write is reported as FAILED (a strike towards the
@@ -147,6 +149,10 @@ UsbIoSamdModule module;
 
 uint16_t usbio_transport_begin() {
   return USBIO_FLAG_VENDOR_INTERFACE | USBIO_FLAG_STREAMING;
+}
+
+uint16_t usbio_transport_stream_packet_max() {
+  return (uint16_t)(USBIO_STREAM_EP_SIZE - 1u); /* Full Speed only */
 }
 
 uint8_t usbio_transport_stream_write(const uint8_t *data, uint16_t len) {
