@@ -332,9 +332,11 @@ latency. The host side is robust to what a real session leaves behind:
   `error()` says why, and `arduino-io stream` exits early printing the reason.
   Opening the device again starts a clean session.
 
-Measured on a Portenta H7 behind a powered USB hub: 2 channels at 10 kHz,
-10 runs of 60 s, about 6 million records, no transfer failures, device
-overruns between 0.01 % and 0.17 % per run. The firmware samples at most one
+Measured on a Portenta H7 behind a USB hub, once with the hub's power adapter
+connected and once without: 2 channels at 10 kHz, 10 runs of 60 s each time,
+about 6 million records per series, no transfer failures, device overruns
+below 0.2 % per run (1.8 % in one run while a drive was being plugged into
+the computer). The firmware samples at most one
 record per `poll()` call, so the ceiling is the sketch's loop rate; see
 [High Speed link quality](#high-speed-link-quality) if streams die with
 `LIBUSB_ERROR_IO`.
@@ -467,9 +469,13 @@ port (two different cables tried), streams died every few seconds with
 the board stopped answering control requests altogether until it was
 replugged, while the sketch itself kept running. Failures scaled with the
 number of bytes per packet, not with time or firmware activity: bit errors on
-the link. The same board and firmware behind a **powered USB hub** ran
-10 x 60 s at 10 kHz without a single failure. If you see these symptoms, put
-a powered hub between the computer and the board, and prefer a short cable.
+the link. The same board and firmware behind a **USB hub** ran 10 x 60 s at
+10 kHz without a single failure, both with the hub's power adapter connected
+and without it. A hub receives and retransmits every High Speed packet, so one
+marginal link becomes two short ones; the link still runs at 480 Mbit/s. A
+USB 3 hub works too, because the board attaches to the USB 2.0 hub built into
+it. If you see these symptoms, put a USB 2.0 or USB 3 hub (external power not
+needed) between the computer and the board, and prefer a short cable.
 
 ## Limitations and follow-ups
 
