@@ -232,6 +232,44 @@ Everything is reported by exceptions derived from `ArduinoDriver::Error`
 `ProtocolError`, `UsbError` …). `Device` validates pins and values locally
 before any USB traffic, so most mistakes fail fast with a precise message.
 
+### Python and R
+
+Both bindings wrap `arduino_driver_c` ([`extras/c_api`](extras/c_api)), a C
+ABI over the driver above, rather than linking the C++ API directly — a
+stable boundary that works across compilers/toolchains, which matters most
+for R (whose Windows builds use a different compiler than this project's
+usual MSVC/Clang). Both currently expose the same subset as this README:
+enumeration, pin configuration, digital/analog/PWM/DAC I/O, and polling
+continuous sampling; pin events and callback-based streaming are not part of
+either binding yet.
+
+Python ([`extras/python`](extras/python)):
+
+```python
+from arduino_driver import Device, PinMode
+
+with Device.open_first() as dev:
+    dev.pin_mode(13, PinMode.OUTPUT)
+    dev.digital_write(13, True)
+```
+
+Install from a checkout with `pip install extras/python`, or from git with
+`pip install "git+https://github.com/pbosetti/ArduinoDriver.git#subdirectory=extras/python"`.
+
+R ([`extras/r/arduinodriver`](extras/r/arduinodriver)):
+
+```r
+dev <- arduinodriver::device_open_first()
+dev$pin_mode(13, arduinodriver::PinMode$OUTPUT)
+dev$digital_write(13, TRUE)
+```
+
+Install with `remotes::install_github("pbosetti/ArduinoDriver", subdir = "extras/r/arduinodriver")`.
+Its `configure` script builds `arduino_driver_c` from source (CMake required)
+and needs network access to fetch this repository unless
+`ARDUINODRIVER_LOCAL_CHECKOUT` points at a local checkout (see
+[`extras/r/arduinodriver/configure`](extras/r/arduinodriver/configure)).
+
 ## Protocol
 
 Full specification: [`usbio_protocol.h`](src/usbio_protocol.h).

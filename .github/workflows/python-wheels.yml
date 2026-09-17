@@ -1,0 +1,71 @@
+name: Python wheels
+
+# Builds the arduino-driver wheel (extras/python) on Linux, macOS and
+# Windows via cibuildwheel, and publishes to PyPI on a version tag. The
+# wheel is py3-none-<platform> (see extras/python/pyproject.toml), so one
+# build per OS/arch is enough -- no per-CPython-version matrix needed.
+
+on:
+  push:
+    branches: [main]
+    tags: ["py-v*"]
+    paths:
+      - "extras/python/**"
+      - "extras/c_api/**"
+      - "extras/driver/**"
+      - "src/usbio_protocol.h"
+      - ".github/workflows/python-wheels.yml"
+  pull_request:
+    paths:
+      - "extras/python/**"
+      - "extras/c_api/**"
+      - "extras/driver/**"
+      - "src/usbio_protocol.h"
+      - ".github/workflows/python-wheels.yml"
+
+jobs:
+  build_wheels:
+    name: wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install libudev headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
+
+      - name: Build wheel
+        uses: pypa/cibuildwheel@v3
+        with:
+          package-dir: extras/python
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: build_wheels
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # trusted publishing (OIDC); no API token needed
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

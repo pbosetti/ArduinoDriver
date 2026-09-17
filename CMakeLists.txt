@@ -29,6 +29,18 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extras/driver/CMakeLists.txt")
   add_subdirectory(extras/driver)
 endif()
 
+# ---- C ABI wrapper (what the Python/R bindings link against) --------------
+# extras/c_api/ is a self-contained CMake project too; it can also be
+# configured alone with `cmake -S extras/c_api -B build`.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extras/c_api/CMakeLists.txt")
+  if(NOT DEFINED ARDUINODRIVER_BUILD_C_API)
+    set(ARDUINODRIVER_BUILD_C_API ${PROJECT_IS_TOP_LEVEL})
+  endif()
+  if(ARDUINODRIVER_BUILD_C_API)
+    add_subdirectory(extras/c_api)
+  endif()
+endif()
+
 # ---- Firmware targets (optional, need arduino-cli on PATH) ----------------
 # `cmake --build build --target firmware-<board>` compiles the example sketch
 # for one board; `firmware-all` compiles every board whose core is installed.

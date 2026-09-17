@@ -1,20 +1,27 @@
 name: Driver CI
 
-# Compile-check the host driver (driver/) on Linux, macOS and Windows.
-# Firmware (arduino/) is intentionally out of scope: it needs arduino-cli
-# and board cores, which this workflow does not set up.
+# Builds and tests the host driver (extras/driver) and its C ABI wrapper
+# (extras/c_api) on Linux, macOS and Windows. Firmware (arduino/) is
+# intentionally out of scope: it needs arduino-cli and board cores, which
+# this workflow does not set up (and the root CMakeLists.txt's firmware-*
+# targets simply do not get defined without arduino-cli on PATH, so
+# configuring from the repo root here stays firmware-free automatically).
 
 on:
   push:
     branches: [main]
     paths:
       - "extras/driver/**"
+      - "extras/c_api/**"
       - "src/usbio_protocol.h"
+      - "CMakeLists.txt"
       - ".github/workflows/driver-ci.yml"
   pull_request:
     paths:
       - "extras/driver/**"
+      - "extras/c_api/**"
       - "src/usbio_protocol.h"
+      - "CMakeLists.txt"
       - ".github/workflows/driver-ci.yml"
 
 jobs:
@@ -58,17 +65,21 @@ jobs:
         uses: actions/cache@v6
         with:
           path: build/_deps
-          key: driver-deps-${{ runner.os }}-${{ hashFiles('extras/driver/CMakeLists.txt') }}
+          key: driver-deps-${{ runner.os }}-${{ hashFiles('extras/driver/CMakeLists.txt', 'extras/c_api/CMakeLists.txt') }}
 
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
         run: |
-          cmake -S extras/driver -B build -G Ninja \
+          cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DARDUINODRIVER_BUILD_TESTS=ON \
-            -DARDUINODRIVER_BUILD_CLI=ON
+            -DARDUINODRIVER_BUILD_CLI=ON \
+            -DARDUINODRIVER_BUILD_C_API=ON
 
       - name: Build
         run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -C Release

@@ -1,0 +1,8 @@
+useDynLib(arduinodriver, .registration = TRUE)
+importFrom(R6, R6Class)
+
+export(Device)
+export(Stream)
+export(PinMode)
+export(device_open_first)
+export(device_open_by_serial)

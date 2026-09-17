@@ -1,0 +1,45 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "arduino-driver"
+version = "0.4.0"
+description = "Python bindings for the ArduinoDriver USB I/O host library"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Paolo Bosetti", email = "paolo.bosetti@me.com" }]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Topic :: System :: Hardware",
+]
+
+[project.urls]
+Homepage = "https://github.com/pbosetti/ArduinoDriver"
+
+[tool.scikit-build]
+wheel.packages = ["src/arduino_driver"]
+# Pure ctypes over a C ABI: nothing here depends on the Python C API, so the
+# wheel is tagged py3-none-<platform> instead of being tied to one CPython
+# ABI. One wheel per OS/arch covers every supported Python version.
+wheel.py-api = "py3"
+cmake.build-type = "Release"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.cibuildwheel]
+# The wheel is py3-none-<platform> (see wheel.py-api above), so building it
+# under one CPython per platform is enough -- there is no ABI-specific code
+# to vary across versions. cibuildwheel still tags each built wheel with
+# that interpreter's cp3xx; scikit-build-core's wheel.py-api overrides it
+# back to py3-none before the wheel is written.
+build = "cp312-*"
+test-requires = "pytest"
+# No board is attached in CI: the hardware-dependent tests skip themselves
+# (see tests/test_device_no_hardware.py's and test_stream_hardware.py's
+# fixtures), so this runs unfiltered.
+test-command = "pytest {project}/tests -v"

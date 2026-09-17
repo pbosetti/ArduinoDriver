@@ -1,0 +1,5 @@
+#!/bin/sh
+# cleanup - removes configure's build artifacts after R CMD INSTALL.
+rm -rf "$(dirname "$0")/src/native-build"
+rm -f "$(dirname "$0")/src/Makevars" "$(dirname "$0")/src/Makevars.win"
+exit 0

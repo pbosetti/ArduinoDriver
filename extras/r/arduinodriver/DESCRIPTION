@@ -1,0 +1,22 @@
+Package: arduinodriver
+Type: Package
+Title: Drive an Arduino Board Running the UsbIo Firmware
+Version: 0.4.0
+Authors@R: person("Paolo", "Bosetti", email = "paolo.bosetti@me.com", role = c("aut", "cre"))
+Description: Bindings to ArduinoDriver, a C++ host library that talks to an
+    Arduino board running the UsbIo firmware over USB vendor control
+    transfers (no serial port): digital I/O, analog input, PWM, DAC and
+    continuous sampling. Wraps the arduino_driver_c C API
+    (<https://github.com/pbosetti/ArduinoDriver>), built from source by this
+    package's configure script.
+License: Apache License (== 2.0)
+Encoding: UTF-8
+SystemRequirements: CMake (>= 3.24), C++20, libusb-1.0 build dependencies
+    (see the parent repository's README for per-OS setup: a udev rule on
+    Linux, WinUSB/Zadig on Windows)
+Imports:
+    R6
+Suggests:
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+RoxygenNote: 7.3.1
