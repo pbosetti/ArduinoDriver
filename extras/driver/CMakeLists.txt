@@ -34,6 +34,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# extras/c_api links arduino_driver (and its fetched deps: fmt, libusb) into
+# a shared library. On ELF (Linux), unlike Mach-O, a static archive built
+# without -fPIC cannot be linked into a .so at all ("relocation ... can not
+# be used when making a shared object"), so every target here needs PIC by
+# default even though this directory itself only ever builds a static
+# library and an executable.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
