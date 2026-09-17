@@ -278,6 +278,12 @@ int cmd_info(Device &dev) {
   fmt::print("queue depth:      {}\n", info.queue_depth);
   if (info.streaming()) {
     fmt::print("stream channels:  up to {}\n", info.stream_max_channels);
+    const std::uint16_t min_period = info.min_stream_period_us();
+    fmt::print("stream period:    {} us or longer (up to {:.0f} Hz{})\n",
+               min_period, 1e6 / min_period,
+               info.stream_min_period_us == 0
+                   ? "; firmware before UsbIo 0.4.0"
+                   : ", bounded by the sketch's loop() rate");
   }
   if (info.events()) {
     fmt::print("event pins:       up to {}\n", info.event_max_pins);
@@ -509,8 +515,13 @@ std::chrono::microseconds resolve_stream_period(const Settings &s) {
     if (!(s.hz > 0.0)) {
       throw UsageError("--hz must be positive");
     }
-    return std::chrono::microseconds(
-        static_cast<long long>(1'000'000.0 / s.hz + 0.5));
+    const auto period_us = static_cast<long long>(1'000'000.0 / s.hz + 0.5);
+    if (period_us == 0) {
+      // 0 would silently mean free running.
+      throw UsageError("--hz above 2000000 rounds to a 0 us period; use "
+                       "--period-us 0 to sample as fast as the board can");
+    }
+    return std::chrono::microseconds(period_us);
   }
   return std::chrono::microseconds{0}; // free running
 }

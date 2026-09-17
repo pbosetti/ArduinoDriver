@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -220,10 +221,10 @@ TEST_CASE("start_stream validates pins/period locally before any USB traffic",
     CHECK_THROWS_AS(rig.device.start_stream(config), InvalidValue);
     CHECK(rig.fake.log().empty());
   }
-  SECTION("period below StreamMinPeriodUs") {
+  SECTION("period below the board's minimum") {
     StreamConfig config;
     config.pins = {19};
-    config.period = std::chrono::microseconds{1};
+    config.period = std::chrono::microseconds{1}; // below the legacy 100 us
     CHECK_THROWS_AS(rig.device.start_stream(config), InvalidValue);
     CHECK(rig.fake.log().empty());
   }
@@ -248,6 +249,59 @@ TEST_CASE("start_stream validates pins/period locally before any USB traffic",
     Stream stream = rig.device.start_stream(config);
     CHECK(rig.fake.stream_period_us() == 0);
     stream.stop();
+  }
+}
+
+TEST_CASE("start_stream accepts periods down to the board's reported minimum",
+          "[stream][api]") {
+  SECTION("firmware before 0.4.0 reports 0: 100 us, with a hint to update") {
+    Rig rig(streaming_board(), fast_options());
+    rig.device.pin_mode(19, PinMode::AnalogIn);
+    CHECK(rig.device.info().min_stream_period_us() == StreamLegacyMinPeriodUs);
+    rig.fake.clear_log();
+    StreamConfig config;
+    config.pins = {19};
+    config.period = 50us;
+    try {
+      rig.device.start_stream(config);
+      FAIL("a 50 us period was accepted");
+    } catch (const InvalidValue &e) {
+      CHECK(std::string(e.what()).find("0.4.0") != std::string::npos);
+    }
+    CHECK(rig.fake.log().empty());
+    config.period = 100us;
+    Stream stream = rig.device.start_stream(config);
+    CHECK(rig.fake.stream_period_us() == 100);
+  }
+  SECTION("current firmware reports 1 us: 20 kHz and beyond") {
+    FakeBoard board = streaming_board();
+    board.stream_min_period_us = StreamMinPeriodUs;
+    Rig rig(board, fast_options());
+    rig.device.pin_mode(19, PinMode::AnalogIn);
+    StreamConfig config;
+    config.pins = {19};
+    config.period = 50us;
+    Stream stream = rig.device.start_stream(config);
+    CHECK(rig.fake.stream_period_us() == 50);
+    stream.stop();
+    config.period = 1us;
+    Stream fastest = rig.device.start_stream(config);
+    CHECK(rig.fake.stream_period_us() == 1);
+  }
+  SECTION("a board reporting a larger minimum is held to it") {
+    FakeBoard board = streaming_board();
+    board.stream_min_period_us = 500;
+    Rig rig(board, fast_options());
+    rig.device.pin_mode(19, PinMode::AnalogIn);
+    rig.fake.clear_log();
+    StreamConfig config;
+    config.pins = {19};
+    config.period = 499us;
+    CHECK_THROWS_AS(rig.device.start_stream(config), InvalidValue);
+    CHECK(rig.fake.log().empty());
+    config.period = 500us;
+    Stream stream = rig.device.start_stream(config);
+    CHECK(rig.fake.stream_period_us() == 500);
   }
 }
 

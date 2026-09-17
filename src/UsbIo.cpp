@@ -391,6 +391,8 @@ bool UsbIoDevice::handle_in(uint8_t bRequest, uint16_t wIndex,
         (_flags & USBIO_FLAG_STREAMING) ? (uint8_t)USBIO_MAX_STREAM_CHANNELS : 0;
     info.event_max_pins =
         (_flags & USBIO_FLAG_EVENTS) ? (uint8_t)USBIO_MAX_EVENT_PINS : 0;
+    info.stream_min_period_us =
+        (_flags & USBIO_FLAG_STREAMING) ? (uint16_t)USBIO_STREAM_MIN_PERIOD_US : 0;
     memcpy(_reply, &info, sizeof(info));
     len = sizeof(info);
     break;
@@ -1038,6 +1040,15 @@ void UsbIoDevice::stream_poll() {
       stream_sample(now);
       if (_stream_period_us != 0) {
         _stream_deadline_us += _stream_period_us;
+        /* Already due again: this record was a whole period late or more
+         * (loop() slower than the period, or a hiccup). Restart the schedule
+         * from now instead of letting the deadline fall further behind: a
+         * lag that kept growing would come back as a burst of catch-up
+         * records, and once past 2^31 us it would flip the signed test above
+         * and stop sampling for half an hour. */
+        if ((int32_t)(now - _stream_deadline_us) >= 0) {
+          _stream_deadline_us = now + _stream_period_us;
+        }
       }
     }
   }

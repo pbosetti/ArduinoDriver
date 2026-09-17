@@ -39,7 +39,7 @@ UsbIo replaces that with a ready-made protocol that is built into USB itself:
 | Finding the board | Port names change (`COM3`, `/dev/ttyACM0`, `/dev/cu.usbmodem1102`) | Found automatically, or by its USB serial number |
 | Errors | A garbled or lost line may go unnoticed | Every command is accepted or rejected with a reason ("pin 3 is not in OUTPUT mode") |
 | Board details | You hard-code pin numbers, ADC resolution, voltages | The board reports which pins can do digital, analog, PWM or DAC, and its resolutions and voltages |
-| Fast sampling | Text lines, no timing, silent losses | Binary stream, up to 10 kHz tested on a Portenta H7; every sample carries the board's own timestamp, and lost samples are counted |
+| Fast sampling | Text lines, no timing, silent losses | Binary stream: a Portenta H7 samples one analog pin at about 32 kHz; every sample carries the board's own timestamp, and lost samples are counted |
 | `Serial` port | Busy with your protocol | Still free for `Serial.print()` debugging |
 
 It also has limits worth knowing up front:
@@ -242,6 +242,7 @@ pins:             26 (analog: 7)
 resolution:       adc 16 bits, pwm 12 bits, dac 12 bits
 voltages:         vref 3300 mV, io 3300 mV
 flags:            0x000F vendor-interface pulldown streaming events
+stream period:    1 us or longer (up to 1000000 Hz, bounded by the sketch's loop() rate)
 ...
 $ arduino-io caps
 PIN  CAPS  NOTES
@@ -310,8 +311,13 @@ stream: 1002 records (2004 samples) in 1.001 s (1000.8 Hz achieved per channel);
 - **`t_us`** is the board's own clock in microseconds, so the timing is
   exact even if the computer is busy. Samples taken at the same instant share
   a timestamp.
-- **Rates** go up to 10 kHz; `--period-us 0` instead of `--hz` samples as
-  fast as the board can.
+- **Rates.** The board takes one sample per `loop()`, so the fastest rate
+  depends on the board, the number of pins and your sketch. With the plain
+  UsbIoDevice sketch, a Portenta H7 reaches about 32 kHz on one pin and
+  23 kHz on two. Ask for more and you simply get that maximum; the summary
+  shows the rate achieved. `--period-us 0` instead of `--hz` always samples
+  as fast as the board can. Boards with UsbIo older than 0.4.0 stop at 10 kHz
+  (`arduino-io info` shows the limit).
 - **The summary line** reports losses: `device overruns` (the board could not
   send fast enough), `seq gaps` (samples lost on the way) and `host drops`
   (the computer did not read fast enough). All zeros means a complete
@@ -363,7 +369,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(FetchContent)
 FetchContent_Declare(ArduinoDriver
   GIT_REPOSITORY https://github.com/pbosetti/ArduinoDriver.git
-  GIT_TAG v0.3.1)
+  GIT_TAG v0.4.0)
 FetchContent_MakeAvailable(ArduinoDriver)
 
 add_executable(io io.cpp)
@@ -555,8 +561,11 @@ What to know:
   always copies whole records.
 - **Each `Sample`** has `pin`, `raw` (the ADC code), `volts`, and `t_us`, the
   board's clock in microseconds when the record was taken.
-- **Rate.** `config.period` sets the time between records (100 µs, i.e.
-  10 kHz, at most). Leave it at `0us` to sample as fast as the board can.
+- **Rate.** `config.period` sets the time between records, in whole
+  microseconds (`50us` is 20 kHz). A period shorter than the board can manage
+  gives its maximum rate (see [section 4](#record-a-signal-stream)); `0us`
+  samples as fast as the board can. Boards with UsbIo older than 0.4.0 refuse
+  periods under 100 µs.
 - **Keep reading.** Samples wait in a queue on the computer (1024 records by
   default, `config.queue_capacity`). If your program falls behind, the oldest
   are dropped and counted in `stats.host_drops`.

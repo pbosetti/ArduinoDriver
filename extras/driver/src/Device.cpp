@@ -395,12 +395,17 @@ Stream Device::start_stream(StreamConfig config) {
     }
   }
   const auto period_raw = config.period.count();
+  const std::uint16_t min_period = _info.min_stream_period_us();
   if (period_raw < 0 || period_raw > 0xFFFF ||
-      (period_raw != 0 && period_raw < StreamMinPeriodUs)) {
-    throw InvalidValue(
-        fmt::format("start_stream: period {} us is outside 0 (free running) "
-                    "or {}..65535",
-                    period_raw, StreamMinPeriodUs));
+      (period_raw != 0 && period_raw < min_period)) {
+    throw InvalidValue(fmt::format(
+        "start_stream: period {} us is outside 0 (free running) or {}..65535 "
+        "for this board{}",
+        period_raw, min_period,
+        _info.stream_min_period_us == 0
+            ? " (its UsbIo firmware predates 0.4.0, which accepts periods "
+              "down to 1 us: update it to stream faster than 10 kHz)"
+            : ""));
   }
   const auto period_us = static_cast<std::uint16_t>(period_raw);
   if (config.queue_capacity == 0) {

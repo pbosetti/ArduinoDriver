@@ -123,7 +123,13 @@ inline constexpr std::size_t QueueDepth = USBIO_QUEUE_DEPTH;
 inline constexpr std::uint16_t StreamMagic = USBIO_STREAM_MAGIC;
 inline constexpr std::size_t StreamEpSize = USBIO_STREAM_EP_SIZE;
 inline constexpr std::size_t MaxStreamChannels = USBIO_MAX_STREAM_CHANNELS;
+/// Shortest period current firmware accepts; each board reports its own in
+/// Info::stream_min_period_us (use Info::min_stream_period_us()).
 inline constexpr std::uint16_t StreamMinPeriodUs = USBIO_STREAM_MIN_PERIOD_US;
+/// Shortest period firmware before UsbIo 0.4.0 accepts (10 kHz); assumed when
+/// a streaming board reports stream_min_period_us == 0.
+inline constexpr std::uint16_t StreamLegacyMinPeriodUs =
+    USBIO_STREAM_LEGACY_MIN_PERIOD_US;
 
 /// Pin event limits (see usbio_protocol.h "Pin events").
 inline constexpr std::size_t MaxEventPins = USBIO_MAX_EVENT_PINS;
@@ -148,7 +154,7 @@ inline constexpr std::size_t IoMv = 16;
 inline constexpr std::size_t Flags = 18;
 inline constexpr std::size_t StreamMaxChannels = 20;
 inline constexpr std::size_t EventMaxPins = 21;
-inline constexpr std::size_t Reserved = 22;
+inline constexpr std::size_t StreamMinPeriodUs = 22;
 } // namespace InfoOffset
 
 /// Byte offsets inside usbio_time_reply_t (GET_TIME reply).
@@ -414,6 +420,10 @@ struct Info {
                                        ///< once; 0 when streaming() is false
   std::uint8_t event_max_pins{0};     ///< pins EVENT_CONFIG watches at once;
                                        ///< 0 when events() is false
+  std::uint16_t stream_min_period_us{0}; ///< as reported: 0 when streaming()
+                                         ///< is false, and on firmware before
+                                         ///< UsbIo 0.4.0 (see
+                                         ///< min_stream_period_us())
 
   constexpr bool has_vendor_interface() const noexcept {
     return (flags & USBIO_FLAG_VENDOR_INTERFACE) != 0;
@@ -429,6 +439,17 @@ struct Info {
   /// True when the board exposes the EVENT_* requests.
   constexpr bool events() const noexcept {
     return (flags & USBIO_FLAG_EVENTS) != 0;
+  }
+  /// Shortest non-zero stream period the board accepts, in microseconds:
+  /// stream_min_period_us, or StreamLegacyMinPeriodUs for firmware before
+  /// UsbIo 0.4.0, which reports 0. 0 when streaming() is false. What the
+  /// board achieves is bounded by its sketch's loop() rate on top of this.
+  constexpr std::uint16_t min_stream_period_us() const noexcept {
+    if (!streaming()) {
+      return 0;
+    }
+    return stream_min_period_us != 0 ? stream_min_period_us
+                                     : StreamLegacyMinPeriodUs;
   }
 };
 
@@ -501,6 +522,7 @@ inline Info decode_info(std::span<const std::byte> bytes) {
   info.flags = read_u16le(bytes, InfoOffset::Flags);
   info.stream_max_channels = read_u8(bytes, InfoOffset::StreamMaxChannels);
   info.event_max_pins = read_u8(bytes, InfoOffset::EventMaxPins);
+  info.stream_min_period_us = read_u16le(bytes, InfoOffset::StreamMinPeriodUs);
   return info;
 }
 

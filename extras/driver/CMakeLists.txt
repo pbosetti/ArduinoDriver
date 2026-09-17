@@ -5,7 +5,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(ArduinoDriver
-  VERSION 0.3.1
+  VERSION 0.4.0
   DESCRIPTION "libusb host driver for the UsbIo Arduino firmware"
   LANGUAGES C CXX) # C: libusb is a C library
 

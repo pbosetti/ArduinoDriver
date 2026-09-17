@@ -138,6 +138,7 @@ voltages:         vref 3300 mV, io 3300 mV
 flags:            0x000F vendor-interface pulldown streaming events
 queue depth:      32
 stream channels:  up to 8
+stream period:    1 us or longer (up to 1000000 Hz, bounded by the sketch's loop() rate)
 event pins:       up to 8
 transport:        device recipient, interface 0 (claimed)
 ```
@@ -187,7 +188,7 @@ builds only the library and its two dependencies:
 ```cmake
 FetchContent_Declare(ArduinoDriver
   GIT_REPOSITORY https://github.com/MADS-NET/ArduinoDriver.git
-  GIT_TAG v0.3.1)
+  GIT_TAG v0.4.0)
 FetchContent_MakeAvailable(ArduinoDriver)
 target_link_libraries(my_app PRIVATE ArduinoDriver::arduino_driver)
 ```
@@ -239,7 +240,7 @@ carry the pin in `wIndex` and the argument in `wValue` and have no data stage.
 
 | bRequest | dir | wIndex | wValue | data |
 |---|---|---|---|---|
-| `0x00 GET_INFO` | IN | – | – | 24-byte info: magic `UIO1`, protocol version, board id, pin counts, ADC/PWM/DAC bits, Vref, logic level, flags |
+| `0x00 GET_INFO` | IN | – | – | 24-byte info: magic `UIO1`, protocol version, board id, pin counts, ADC/PWM/DAC bits, Vref, logic level, flags, stream channels, event pins, shortest stream period |
 | `0x01 GET_PIN_CAPS` | IN | first pin | – | one capability byte per pin: DIO, AIN, PWM, DAC bits |
 | `0x02 PIN_MODE` | OUT | pin | INPUT, OUTPUT, INPUT_PULLUP, INPUT_PULLDOWN, ANALOG_IN, PWM, DAC | – |
 | `0x03 DIO_READ` | IN | pin | – | status, value |
@@ -328,6 +329,26 @@ appears as a gap in `seq`, and `stats()` accounts for gaps, host-side drops and
 resyncs separately. While a stream runs the `Device` refuses other calls with
 `DeviceBusy`; `RESET`, a `pin_mode()` on a selected pin, and unplugging all
 stop it.
+
+**Sampling rate.** The period (`--hz` or `--period-us`, `StreamConfig::period`)
+must be at least the board's `stream_min_period_us`, which `arduino-io info`
+prints: 1 µs from UsbIo 0.4.0, so any rate can be requested. Firmware before
+0.4.0 reports 0 there and only accepts 100 µs (10 kHz) or longer; the driver
+says so instead of letting the device refuse the request. What the board
+actually achieves is bounded by the sketch: it takes at most one record per
+`UsbIo.poll()`, so a period shorter than one `loop()` iteration yields the
+loop rate — the same as free running (`--period-us 0`), and the summary's
+"achieved" rate shows it. A late record restarts the schedule from that
+moment instead of being followed by a burst of catch-up records, so a hiccup
+shows up as a longer gap in `t_us`.
+
+Measured on a Portenta H7 behind a USB hub, running the plain `UsbIoDevice`
+sketch, 10 s per run: free running reaches about 32 kHz with one channel and
+23.5 kHz with two. A 20 kHz request is met with both (19,995 Hz on average;
+records land on `loop()` iterations, so their spacing ranges from about 30 to
+70 µs around the nominal 50 µs), 30 kHz is met with one channel, and a 30 kHz
+request on two channels runs at the 23.5 kHz loop rate. Device overruns stayed
+below 0.05 %, each run's in a single burst of a few milliseconds.
 
 On the wire, the firmware packs whole records into each bulk packet (up to
 511 bytes on a High Speed board, 63 on Full Speed) and sends a partly filled

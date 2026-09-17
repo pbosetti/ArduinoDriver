@@ -68,7 +68,12 @@
  *
  * Sampling runs from loop(), not from an interrupt, so the achieved period is
  * best-effort: t_us in each record - the device's own micros() at sample time -
- * is the timing reference, not the host's arrival time. When the device's ring
+ * is the timing reference, not the host's arrival time. The device takes at
+ * most one record per poll(): a period shorter than one loop() iteration
+ * yields the loop rate, without falling further behind (a late record moves
+ * the schedule forward instead of being followed by a catch-up burst). This is
+ * why stream_min_period_us can be as low as 1 us: it bounds what the device
+ * accepts, not what it achieves. When the device's ring
  * fills, the newest record is dropped and overruns is incremented, which the
  * host also sees as a gap in seq (unless STOP_ON_OVERRUN was requested).
  *
@@ -278,8 +283,14 @@ enum usbio_board_id {
                                       * (high speed boards declare 512); hosts
                                       * use the descriptor's value             */
 #define USBIO_MAX_STREAM_CHANNELS 8u /* upper bound on stream_max_channels     */
-#define USBIO_STREAM_MIN_PERIOD_US 100u /* fastest period a device must accept;
-                                         * 0 means free running                */
+#define USBIO_STREAM_MIN_PERIOD_US 1u /* shortest non-zero period this firmware
+                                       * accepts, reported in
+                                       * usbio_info_t.stream_min_period_us;
+                                       * 0 means free running                  */
+#define USBIO_STREAM_LEGACY_MIN_PERIOD_US 100u /* shortest period firmware before
+                                                * UsbIo 0.4.0 accepts: assume it
+                                                * when stream_min_period_us is 0
+                                                * on a streaming board         */
 
 /* Pin events. The per-pop and per-counts limits keep both replies inside the
  * 64-byte EP0 buffer of the SAMD core, the smallest of the supported stacks:
@@ -312,7 +323,13 @@ typedef struct usbio_info {
                                    * USBIO_FLAG_STREAMING is clear            */
   uint8_t event_max_pins;         /* pins EVENT_CONFIG watches at once; 0 when
                                    * USBIO_FLAG_EVENTS is clear               */
-  uint8_t reserved[2];            /* zero                                     */
+  uint16_t stream_min_period_us;  /* shortest non-zero STREAM_START period, in
+                                   * microseconds; 0 when USBIO_FLAG_STREAMING
+                                   * is clear. Firmware before UsbIo 0.4.0 sent
+                                   * zero here (the field was reserved) and
+                                   * accepts USBIO_STREAM_LEGACY_MIN_PERIOD_US.
+                                   * The rate actually achieved is bounded by
+                                   * the sketch's loop() rate, see "Streaming". */
 } usbio_info_t;
 USBIO_STATIC_ASSERT(sizeof(usbio_info_t) == 24, "usbio_info_t must be 24 bytes");
 
@@ -456,7 +473,8 @@ USBIO_STATIC_ASSERT(sizeof(usbio_stream_header_t) == 12, "usbio_stream_header_t 
  *             BAD_VALUE); adding beyond stream_max_channels -> BAD_VALUE.
  *             Adding a selected pin or removing an unselected one is a no-op.
  *  START      stream stopped (else BUSY), n_channels > 0 (else BAD_VALUE),
- *             wValue == 0 or >= USBIO_STREAM_MIN_PERIOD_US (else BAD_VALUE),
+ *             wValue == 0 or >= GET_INFO's stream_min_period_us (else
+ *             BAD_VALUE; USBIO_STREAM_LEGACY_MIN_PERIOD_US before UsbIo 0.4.0),
  *             wIndex has no unknown flag bit (else BAD_VALUE). Resets seq,
  *             overruns and the ring, then starts sampling from loop().
  *  STOP       always accepted; stops sampling and keeps the selection. Records

@@ -227,7 +227,8 @@ constexpr std::array<std::uint8_t, InfoLen> PortentaInfo{
     0xE4, 0x0C,           // vref_mv = 3300
     0xE4, 0x0C,           // io_mv = 3300
     0x03, 0x00,           // flags = VENDOR_INTERFACE | PULLDOWN
-    0,    0,    0,   0,   // reserved
+    0,    0,              // stream_max_channels, event_max_pins
+    0,    0,              // stream_min_period_us
 };
 
 } // namespace
@@ -256,6 +257,20 @@ TEST_CASE("decode_info reads usbio_info_t field by field, little-endian",
     raw[14] = 0x0C; // vref_mv bytes swapped
     raw[15] = 0xE4;
     CHECK(decode_info(info_bytes(raw)).vref_mv == 0xE40C);
+  }
+  SECTION("stream_min_period_us, and the pre-0.4.0 default") {
+    std::array<std::uint8_t, InfoLen> raw = PortentaInfo;
+    CHECK(decode_info(info_bytes(raw)).min_stream_period_us() == 0);
+    raw[18] = static_cast<std::uint8_t>(raw[18] | USBIO_FLAG_STREAMING);
+    raw[20] = 8; // stream_max_channels
+    const Info legacy = decode_info(info_bytes(raw));
+    CHECK(legacy.stream_min_period_us == 0);
+    CHECK(legacy.min_stream_period_us() == StreamLegacyMinPeriodUs);
+    raw[22] = 0x2C; // 300 us, little-endian
+    raw[23] = 0x01;
+    const Info current = decode_info(info_bytes(raw));
+    CHECK(current.stream_min_period_us == 300);
+    CHECK(current.min_stream_period_us() == 300);
   }
   SECTION("the protocol version is decoded, not enforced") {
     std::array<std::uint8_t, InfoLen> raw = PortentaInfo;

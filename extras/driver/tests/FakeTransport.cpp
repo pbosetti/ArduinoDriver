@@ -739,9 +739,7 @@ std::size_t FakeTransport::encode_info(std::span<std::byte> out) {
   write_u16le(out, InfoOffset::Flags, _board.flags);
   write_u8(out, InfoOffset::StreamMaxChannels, _board.stream_max_channels);
   write_u8(out, InfoOffset::EventMaxPins, _board.event_max_pins);
-  for (std::size_t i = 0; i < 2; ++i) {
-    write_u8(out, InfoOffset::Reserved + i, 0);
-  }
+  write_u16le(out, InfoOffset::StreamMinPeriodUs, _board.stream_min_period_us);
   return InfoLen;
 }
 
@@ -788,7 +786,10 @@ void FakeTransport::handle_stream_start(std::uint16_t value,
   if (_stream_selected.empty()) {
     stall(Status::BadValue);
   }
-  if (value != 0 && value < StreamMinPeriodUs) {
+  const std::uint16_t min_period = _board.stream_min_period_us != 0
+                                       ? _board.stream_min_period_us
+                                       : StreamLegacyMinPeriodUs;
+  if (value != 0 && value < min_period) {
     stall(Status::BadValue);
   }
   constexpr auto known_flags = static_cast<std::uint16_t>(

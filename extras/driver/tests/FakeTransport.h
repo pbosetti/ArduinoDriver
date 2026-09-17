@@ -51,6 +51,11 @@ struct FakeBoard {
   /// USBIO_FLAG_EVENTS too, e.g. `board.flags |= USBIO_FLAG_EVENTS;
   /// board.event_max_pins = 4;`).
   std::uint8_t event_max_pins{0};
+  /// usbio_info_t.stream_min_period_us. 0 by default, as firmware before
+  /// UsbIo 0.4.0 reports it: STREAM_START then accepts periods down to
+  /// StreamLegacyMinPeriodUs, like that firmware. Set StreamMinPeriodUs to
+  /// model current firmware.
+  std::uint16_t stream_min_period_us{0};
 
   std::uint8_t n_pins() const noexcept;
   /// Pins carrying PinCaps::Ain, ascending.

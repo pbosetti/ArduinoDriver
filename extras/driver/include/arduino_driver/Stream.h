@@ -60,8 +60,11 @@ struct StreamConfig {
   /// already be in ANALOG_IN or an INPUT* mode (else the device STALLs
   /// STREAM_SELECT with BAD_MODE, surfaced as InvalidMode).
   std::vector<std::uint8_t> pins;
-  /// Sampling period; 0 means free-running. Otherwise clamped to
-  /// StreamMinPeriodUs .. 65535 us (else InvalidValue).
+  /// Sampling period; 0 means free-running. Otherwise it must lie in
+  /// Info::min_stream_period_us() .. 65535 us (else InvalidValue): 1 us on
+  /// UsbIo 0.4.0 firmware, 100 us before. The device takes at most one record
+  /// per loop() iteration, so a period shorter than the sketch's loop yields
+  /// the loop rate; Sample::t_us tells what was achieved.
   std::chrono::microseconds period{0};
   /// enum usbio_stream_flags bits (StreamFlags::Digital / StopOnOverrun).
   std::uint8_t flags{0};
