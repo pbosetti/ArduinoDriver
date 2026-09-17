@@ -14,6 +14,8 @@ control transfers, the same way it would talk to a purpose-built USB device.
 └──────────────┘   GET_INFO / PIN_MODE / DIO_* / AI_* ...   └──────────────────┘
 ```
 
+> See also [QUICKSTART.md](QUICKSTART.md) 
+
 The repository *is* the Arduino library: `library.properties`, `src/` and
 `examples/` sit at the root, so it installs and publishes like any other
 library. Everything the Arduino IDE ignores lives under `extras/`.
