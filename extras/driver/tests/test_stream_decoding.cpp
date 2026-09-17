@@ -325,6 +325,51 @@ TEST_CASE("Stream stops and reports why when bulk_in() fails",
   CHECK(stream.error().find("LIBUSB_ERROR_PIPE") != std::string::npos);
 }
 
+TEST_CASE("Stream ends, keeping its records, when the device stops streaming",
+          "[stream][decoding]") {
+  Rig rig(streaming_board(), fast_options());
+  rig.device.pin_mode(15, PinMode::AnalogIn);
+  StreamConfig config;
+  config.pins = {15};
+  Stream stream = rig.device.start_stream(config);
+
+  rig.fake.set_stream_ramp(/*start=*/100, /*step=*/10, /*t0_us=*/1000,
+                           /*dt_us=*/500);
+  rig.fake.queue_stream_records(2);
+  drain(stream, 2);
+
+  // Records still in transit when another session stops the device stream.
+  rig.fake.queue_stream_records(3);
+  rig.fake.stop_stream_on_device();
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  while (stream.running() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  REQUIRE_FALSE(stream.running());
+  CHECK(stream.error().find("device stopped streaming") != std::string::npos);
+  const std::vector<Sample> tail = drain(stream, 3);
+  CHECK(tail.front().raw == 120);
+  CHECK(stream.stats().records_received == 5);
+
+  stream.stop();
+  CHECK(stream.error().find("device stopped streaming") != std::string::npos);
+}
+
+TEST_CASE("an idle stream on a running device keeps running",
+          "[stream][decoding]") {
+  Rig rig(streaming_board(), fast_options());
+  rig.device.pin_mode(15, PinMode::AnalogIn);
+  StreamConfig config;
+  config.pins = {15};
+  Stream stream = rig.device.start_stream(config);
+
+  // No records for longer than two GET_STREAM_STATUS polls.
+  std::this_thread::sleep_for(450ms);
+  CHECK(stream.running());
+  CHECK(stream.error().empty());
+  CHECK(rig.fake.count(Request::StreamStatus) >= 2);
+}
+
 TEST_CASE("a regular stop() leaves Stream::error() empty", "[stream][decoding]") {
   Rig rig(streaming_board(), fast_options());
   rig.device.pin_mode(15, PinMode::AnalogIn);

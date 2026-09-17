@@ -5,7 +5,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(ArduinoDriver
-  VERSION 0.1.0
+  VERSION 0.3.1
   DESCRIPTION "libusb host driver for the UsbIo Arduino firmware"
   LANGUAGES C CXX) # C: libusb is a C library
 
@@ -155,6 +155,12 @@ if(ARDUINODRIVER_BUILD_CLI)
     ArduinoDriver::arduino_driver
     fmt::fmt
     cxxopts::cxxopts)
+
+  # `cmake --install build` puts the tool in <prefix>/bin. It links libusb
+  # statically unless ARDUINODRIVER_SYSTEM_LIBUSB is ON, so it needs nothing
+  # else from the build tree.
+  include(GNUInstallDirs)
+  install(TARGETS arduino-io RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # ---- Tests -----------------------------------------------------------------

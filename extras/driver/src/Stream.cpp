@@ -99,6 +99,9 @@ void Stream::Impl::worker_main() {
   std::array<std::byte, ChunkSize> chunk{};
   std::optional<std::uint32_t> last_seq;
   bool hunting = false;
+  // Set once GET_STREAM_STATUS reports that the device is no longer sampling
+  // although this Stream never asked it to stop.
+  bool device_stopped = false;
   auto next_status_poll = std::chrono::steady_clock::now();
 
   while (!stop_requested.load(std::memory_order_acquire)) {
@@ -114,6 +117,15 @@ void Stream::Impl::worker_main() {
     if (n > 0) {
       buffer.insert(buffer.end(), chunk.begin(),
                     chunk.begin() + static_cast<std::ptrdiff_t>(n));
+    } else if (device_stopped) {
+      // The records the device produced before stopping have all been read:
+      // nothing more will ever arrive, so end the stream instead of waiting.
+      std::lock_guard<std::mutex> lock(mutex);
+      error = "the device stopped streaming (STREAM_STOP, RESET or PIN_MODE "
+              "on a streamed pin from another session, an overrun with "
+              "StopOnOverrun, or the device giving up on an endpoint the "
+              "host did not drain)";
+      break;
     }
 
     std::size_t pos = 0;
@@ -187,6 +199,12 @@ void Stream::Impl::worker_main() {
         const StreamStatus st = Stream::poll_status(device);
         std::lock_guard<std::mutex> lock(mutex);
         stats.device_overruns = st.overruns;
+        // stop() sets stop_requested before STREAM_STOP goes out, so a
+        // device that is not running here was stopped by someone else. Keep
+        // reading until its endpoint is empty (see above), then end.
+        if (!st.running) {
+          device_stopped = true;
+        }
       } catch (const Error &) {
         // transient (e.g. a control-transfer timeout): retry next round
       }

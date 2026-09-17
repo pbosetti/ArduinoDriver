@@ -122,13 +122,19 @@ public:
   StreamStats stats() const;
 
   /// True until stop() has completed (or the destructor has run), or until
-  /// the worker stopped on its own after a transport failure (see error()).
+  /// the worker stopped on its own (see error()).
   bool running() const noexcept;
 
-  /// Why the worker stopped on its own: the message of the transport error
-  /// that ended the stream (e.g. a failed bulk IN transfer, or the device
-  /// being unplugged). Empty while the stream runs normally and after a
-  /// regular stop(). Safe to call from any thread at any time.
+  /// Why the worker stopped on its own. Either the message of the transport
+  /// error that ended the stream (e.g. a failed bulk IN transfer, or the
+  /// device being unplugged), or a note that the device itself stopped
+  /// sampling: the worker polls GET_STREAM_STATUS about every 200 ms, and
+  /// once the device reports it is not running (STREAM_STOP, RESET or
+  /// PIN_MODE on a streamed pin from another session, StopOnOverrun, or the
+  /// firmware giving up on an endpoint the host did not drain) it reads the
+  /// records still in transit and then stops. Empty while the stream runs
+  /// normally and after a regular stop(). Records decoded before the worker
+  /// stopped stay readable. Safe to call from any thread at any time.
   std::string error() const;
 
   /// Pins in selection order, as given to Device::start_stream().

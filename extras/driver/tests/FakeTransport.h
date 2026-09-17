@@ -13,6 +13,7 @@
 #include "arduino_driver/Transport.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -159,6 +160,12 @@ public:
   /// Device-side ring overruns GET_STREAM_STATUS should report next
   /// (guarded: safe to call while a Stream's worker thread is running).
   void set_stream_overruns(std::uint32_t n) noexcept;
+  /// Stops sampling on the device side, the way another session's
+  /// STREAM_STOP / RESET / PIN_MODE, or the firmware giving up on an
+  /// undrained endpoint, would: GET_STREAM_STATUS reports running == 0 from
+  /// now on, and the selection is kept. Safe to call while a Stream's worker
+  /// thread is running.
+  void stop_stream_on_device() noexcept { _stream_running = false; }
 
   // ---- Device clock (millis()/micros()), and pin events ----------------------
   // GET_TIME serves these two counters directly. They also drive the events
@@ -315,8 +322,10 @@ private:
   std::uint16_t _protocol_version{ProtocolVersion};
   std::array<char, USBIO_MAGIC_LEN> _magic{};
 
-  // Streaming (device-side selection/scheduler state).
-  bool _stream_running{false};
+  // Streaming (device-side selection/scheduler state). _stream_running is
+  // atomic: the worker's GET_STREAM_STATUS polls read it while
+  // stop_stream_on_device() writes it from the test thread.
+  std::atomic<bool> _stream_running{false};
   std::vector<std::uint8_t> _stream_selected;
   std::uint8_t _stream_flags{0};
   std::uint16_t _stream_period_us{0};

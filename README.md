@@ -160,6 +160,19 @@ build/extras/driver/arduino-io list
 `cmake -S extras/driver -B build` configures the driver alone, without the
 `firmware-*` targets.
 
+To put `arduino-io` on your `PATH`, install it (into `/usr/local/bin` by
+default; choose another prefix with `--prefix`):
+
+```bash
+cmake --install build                     # may need sudo for /usr/local
+cmake --install build --prefix ~/.local   # or a user-writable prefix
+```
+
+The installed tool is self-contained: libusb is linked statically, unless
+`-DARDUINODRIVER_SYSTEM_LIBUSB=ON` was given. On Linux, also install the udev
+rule described in [Operating-system notes](#operating-system-notes) to use it
+without root.
+
 Dependencies (libusb via the official `libusb-cmake` wrapper, `fmt`, `cxxopts`,
 Catch2) are fetched with `FetchContent` and pinned. `-DARDUINODRIVER_SYSTEM_LIBUSB=ON`
 uses the system libusb-1.0 through pkg-config instead. Windows builds with
@@ -172,7 +185,7 @@ builds only the library and its two dependencies:
 ```cmake
 FetchContent_Declare(ArduinoDriver
   GIT_REPOSITORY https://github.com/MADS-NET/ArduinoDriver.git
-  GIT_TAG v0.1.0)
+  GIT_TAG v0.3.1)
 FetchContent_MakeAvailable(ArduinoDriver)
 target_link_libraries(my_app PRIVATE ArduinoDriver::arduino_driver)
 ```
@@ -331,6 +344,12 @@ latency. The host side is robust to what a real session leaves behind:
 - A failed bulk transfer ends the stream: `running()` turns false and
   `error()` says why, and `arduino-io stream` exits early printing the reason.
   Opening the device again starts a clean session.
+- So does a device that stops sampling on its own: `STREAM_STOP`, `RESET` or
+  `PIN_MODE` on a streamed pin from another session, an overrun with
+  `StopOnOverrun`, or the firmware giving up on an endpoint the host does not
+  drain. The worker sees `running == 0` in its periodic `GET_STREAM_STATUS`
+  poll (every 200 ms), reads the records still in transit, then stops with
+  `error()` saying so, instead of waiting for data that never comes.
 
 Measured on a Portenta H7 behind a USB hub, once with the hub's power adapter
 connected and once without: 2 channels at 10 kHz, 10 runs of 60 s each time,
