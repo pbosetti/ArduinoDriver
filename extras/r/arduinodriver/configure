@@ -54,6 +54,7 @@ fi
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DARDUINODRIVER_C_API_SHARED=OFF \
+  -DLIBUSB_ENABLE_UDEV=OFF \
   -DARDUINODRIVER_C_API_BUILD_TESTS=OFF \
   -DARDUINODRIVER_C_API_INSTALL=OFF \
   -DARDUINODRIVER_BUILD_CLI=OFF
@@ -85,12 +86,14 @@ done
 HEADER_DIR=$(dirname "$HEADER")
 EXPORT_HEADER_DIR=$(dirname "$EXPORT_HEADER")
 
-# Matches what .github/workflows/driver-ci.yml installs for the driver's own
-# Linux CI build (libudev-dev), since libusb-cmake links against it there.
+# No -ludev on Linux: the CMake invocation above builds libusb with
+# LIBUSB_ENABLE_UDEV=OFF, so the package needs neither libudev headers at
+# build time nor libudev.so.1 at run time (libusb uses its netlink hotplug
+# path instead; device enumeration is unaffected).
 EXTRA_LIBS=""
 case "$(uname -s)" in
   Darwin) EXTRA_LIBS="-framework Foundation -framework IOKit -framework Security" ;;
-  Linux) EXTRA_LIBS="-ludev -lpthread -lrt" ;;
+  Linux) EXTRA_LIBS="-lpthread -lrt" ;;
 esac
 
 cat > "$PKG_ROOT/src/Makevars" <<EOF

@@ -82,4 +82,6 @@ jobs:
         run: cmake --build build
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure -C Release
+        # --timeout so a wedged test fails the job in minutes instead of
+        # running until the 6h runner limit.
+        run: ctest --test-dir build --output-on-failure -C Release --timeout 120

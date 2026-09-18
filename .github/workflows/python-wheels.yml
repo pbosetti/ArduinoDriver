@@ -35,11 +35,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install libudev headers (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev
+      # No libudev step here on purpose: Linux wheels are built inside a
+      # manylinux container, so installing headers on the runner host would
+      # not reach the build. extras/python/CMakeLists.txt turns libusb's
+      # udev backend off instead.
 
       - name: Build wheel
         uses: pypa/cibuildwheel@v4.2.1

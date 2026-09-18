@@ -39,7 +39,9 @@ testpaths = ["tests"]
 # back to py3-none before the wheel is written.
 build = "cp312-*"
 test-requires = "pytest"
-# No board is attached in CI: the hardware-dependent tests skip themselves
-# (see tests/test_device_no_hardware.py's and test_stream_hardware.py's
-# fixtures), so this runs unfiltered.
-test-command = "pytest {project}/tests -v"
+# {package} is this directory (extras/python); {project} would be the repo
+# root, which has no tests/ of its own. No board is attached in CI: the
+# hardware-dependent tests skip themselves (see the fixtures in
+# tests/test_device_no_hardware.py and tests/test_stream_hardware.py), so
+# this runs unfiltered.
+test-command = "pytest {package}/tests -v"
