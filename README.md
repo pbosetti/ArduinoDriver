@@ -201,7 +201,8 @@ arduino-io caps                     # per-pin capability table
 arduino-io mode 13 output && arduino-io write 13 1
 arduino-io mode 14 analog  && arduino-io aread 14 --volts
 arduino-io mode 9 pwm      && arduino-io pwm 9 50%
-arduino-io monitor --hz 10 14 15    # repeated control reads until Ctrl-C
+arduino-io monitor 14,15 --hz 10    # repeated control reads until Ctrl-C
+arduino-io monitor 14 --csv log.csv # ... also logged as CSV (--csv - for stdout)
 arduino-io stream 15,16 --hz 1000   # continuous sampling over the bulk endpoint
 arduino-io --help                   # full command list
 ```

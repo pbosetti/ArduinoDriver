@@ -282,7 +282,9 @@ arduino-io mode 15 analog && arduino-io aread 15 --volts
 arduino-io mode 5 pwm     && arduino-io pwm 5 25%    # 25% duty cycle
 arduino-io mode 21 dac    && arduino-io dac 21 1.5V  # 1.5 V on the DAC pin
 arduino-io areadall --volts                          # every analog pin at once
-arduino-io monitor --hz 10 2 15                      # print pins 2 and 15, 10 times a second
+arduino-io monitor 2,15 --hz 10                      # print pins 2 and 15, 10 times a second
+arduino-io monitor 2,15 --hz 10 --csv log.csv        # same, and log each line to log.csv
+arduino-io monitor 2,15 --csv - > log.csv            # CSV only, on stdout
 arduino-io reset                                     # every pin back to INPUT
 ```
 

@@ -424,60 +424,6 @@ int cmd_time(Device &dev) {
   return ExitOk;
 }
 
-/// Prints DIO levels and analog samples of the selected pins (all pins when
-/// none is given) until Ctrl-C. Pins must have been configured with `mode`
-/// beforehand: unconfigured pins read 0.
-int cmd_monitor(Device &dev, const std::vector<std::string> &args,
-                const Settings &s) {
-  std::vector<std::uint8_t> pins;
-  for (const std::string &arg : args) {
-    const std::uint8_t pin = parse_pin(arg);
-    dev.pin_caps(pin); // range check before starting
-    pins.push_back(pin);
-  }
-  if (pins.empty()) {
-    for (std::uint8_t pin = 0; pin < dev.pin_count(); ++pin) {
-      pins.push_back(pin);
-    }
-  }
-  const std::vector<std::uint8_t> &analog = dev.analog_pins();
-  const auto period = std::chrono::duration<double>(1.0 / s.hz);
-  std::signal(SIGINT, on_interrupt);
-  const auto start = std::chrono::steady_clock::now();
-  while (!StopRequested.load()) {
-    const auto now = std::chrono::steady_clock::now();
-    const std::vector<bool> levels = dev.read_all_digital();
-    const std::vector<std::uint16_t> samples = dev.read_all_analog();
-    std::string line = fmt::format(
-        "{:>9.3f}s", std::chrono::duration<double>(now - start).count());
-    for (const std::uint8_t pin : pins) {
-      const PinCaps caps = dev.pin_caps(pin);
-      if (caps.dio()) {
-        line += fmt::format(" D{}={}", pin, levels[pin] ? 1 : 0);
-      }
-      if (caps.ain()) {
-        const auto it = std::find(analog.begin(), analog.end(), pin);
-        const auto index = static_cast<std::size_t>(it - analog.begin());
-        line += fmt::format(" A{}={}", pin,
-                            analog_value(dev, samples[index], s.volts));
-      }
-    }
-    fmt::print("{}\n", line);
-    std::fflush(stdout);
-    const auto deadline =
-        now +
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
-    while (!StopRequested.load() &&
-           std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(
-          std::min(50ms, std::chrono::duration_cast<std::chrono::milliseconds>(
-                             deadline - std::chrono::steady_clock::now()) +
-                             1ms));
-    }
-  }
-  return ExitOk;
-}
-
 /// Comma-separated pin list, e.g. "14,15,16".
 std::vector<std::uint8_t> parse_pin_list(std::string_view text) {
   std::vector<std::uint8_t> pins;
@@ -500,6 +446,126 @@ std::vector<std::uint8_t> parse_pin_list(std::string_view text) {
     throw UsageError(fmt::format("invalid pin list \"{}\"", text));
   }
   return pins;
+}
+
+/// A little RAII wrapper so an early exception (a bad --csv path, a
+/// rejected start_stream()) still closes the file.
+struct FileCloser {
+  void operator()(std::FILE *f) const noexcept {
+    if (f != nullptr) {
+      std::fclose(f);
+    }
+  }
+};
+using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
+
+/// Destination of --csv: `out` is null when --csv was not given, stdout for
+/// "--csv -", otherwise the opened FILE (owned by `file`).
+struct CsvSink {
+  FilePtr file;
+  std::FILE *out{nullptr};
+};
+
+CsvSink open_csv(const Settings &s) {
+  CsvSink sink;
+  if (!s.csv_path) {
+    return sink;
+  }
+  if (*s.csv_path == "-") {
+    sink.out = stdout;
+    return sink;
+  }
+  std::FILE *f = std::fopen(s.csv_path->c_str(), "w");
+  if (f == nullptr) {
+    throw UsageError(
+        fmt::format("cannot open \"{}\" for writing", *s.csv_path));
+  }
+  sink.file.reset(f);
+  sink.out = f;
+  return sink;
+}
+
+/// Prints DIO levels and analog samples of the selected pins (all pins when
+/// none is given) until Ctrl-C. Pins must have been configured with `mode`
+/// beforehand: unconfigured pins read 0. Pins are comma- and/or
+/// space-separated ("2,15" or "2 15"). With --csv FILE, every refresh is
+/// also logged there as one row (`t_s,D<pin>,A<pin>,...`, the same columns
+/// as the terminal readout); --csv - prints that CSV on stdout instead of the
+/// readout.
+int cmd_monitor(Device &dev, const std::vector<std::string> &args,
+                const Settings &s) {
+  std::vector<std::uint8_t> pins;
+  for (const std::string &arg : args) {
+    for (const std::uint8_t pin : parse_pin_list(arg)) {
+      dev.pin_caps(pin); // range check before starting
+      pins.push_back(pin);
+    }
+  }
+  if (pins.empty()) {
+    for (std::uint8_t pin = 0; pin < dev.pin_count(); ++pin) {
+      pins.push_back(pin);
+    }
+  }
+  const std::vector<std::uint8_t> &analog = dev.analog_pins();
+  const CsvSink csv = open_csv(s);
+  const bool readout = csv.out != stdout;
+  if (csv.out != nullptr) {
+    std::string header = "t_s";
+    for (const std::uint8_t pin : pins) {
+      const PinCaps caps = dev.pin_caps(pin);
+      if (caps.dio()) {
+        header += fmt::format(",D{}", pin);
+      }
+      if (caps.ain()) {
+        header += fmt::format(",A{}", pin);
+      }
+    }
+    fmt::print(csv.out, "{}\n", header);
+  }
+  const auto period = std::chrono::duration<double>(1.0 / s.hz);
+  std::signal(SIGINT, on_interrupt);
+  const auto start = std::chrono::steady_clock::now();
+  while (!StopRequested.load()) {
+    const auto now = std::chrono::steady_clock::now();
+    const std::vector<bool> levels = dev.read_all_digital();
+    const std::vector<std::uint16_t> samples = dev.read_all_analog();
+    const double t_s = std::chrono::duration<double>(now - start).count();
+    std::string line = fmt::format("{:>9.3f}s", t_s);
+    std::string row = fmt::format("{:.6f}", t_s);
+    for (const std::uint8_t pin : pins) {
+      const PinCaps caps = dev.pin_caps(pin);
+      if (caps.dio()) {
+        const int level = levels[pin] ? 1 : 0;
+        line += fmt::format(" D{}={}", pin, level);
+        row += fmt::format(",{}", level);
+      }
+      if (caps.ain()) {
+        const auto it = std::find(analog.begin(), analog.end(), pin);
+        const auto index = static_cast<std::size_t>(it - analog.begin());
+        const std::string value = analog_value(dev, samples[index], s.volts);
+        line += fmt::format(" A{}={}", pin, value);
+        row += fmt::format(",{}", value);
+      }
+    }
+    if (readout) {
+      fmt::print("{}\n", line);
+    }
+    if (csv.out != nullptr) {
+      fmt::print(csv.out, "{}\n", row);
+    }
+    std::fflush(stdout);
+    const auto deadline =
+        now +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
+    while (!StopRequested.load() &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(
+          std::min(50ms, std::chrono::duration_cast<std::chrono::milliseconds>(
+                             deadline - std::chrono::steady_clock::now()) +
+                             1ms));
+    }
+  }
+  return ExitOk;
 }
 
 /// StreamConfig::period from --hz / --period-us (mutually exclusive; neither
@@ -526,18 +592,7 @@ std::chrono::microseconds resolve_stream_period(const Settings &s) {
   return std::chrono::microseconds{0}; // free running
 }
 
-/// A little RAII wrapper so an early exception (a bad --csv path, a
-/// rejected start_stream()) still closes the file.
-struct FileCloser {
-  void operator()(std::FILE *f) const noexcept {
-    if (f != nullptr) {
-      std::fclose(f);
-    }
-  }
-};
-using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
-
-/// Streams the selected pins to CSV (stdout, or --csv FILE) until --seconds
+/// Streams the selected pins to CSV (stdout or --csv -, or --csv FILE) until --seconds
 /// elapses or Ctrl-C, then prints a summary (achieved rate, drop counts) to
 /// stderr so a plain `> file.csv` redirection stays clean CSV.
 int cmd_stream(Device &dev, const std::vector<std::string> &args,
@@ -552,17 +607,8 @@ int cmd_stream(Device &dev, const std::vector<std::string> &args,
   config.period = resolve_stream_period(s);
   Stream stream = dev.start_stream(config);
 
-  FilePtr csv_guard;
-  std::FILE *out = stdout;
-  if (s.csv_path) {
-    std::FILE *f = std::fopen(s.csv_path->c_str(), "w");
-    if (f == nullptr) {
-      throw UsageError(
-          fmt::format("cannot open \"{}\" for writing", *s.csv_path));
-    }
-    csv_guard.reset(f);
-    out = f;
-  }
+  const CsvSink csv = open_csv(s);
+  std::FILE *out = csv.out != nullptr ? csv.out : stdout;
   fmt::print(out, "t_us,pin,{}\n", s.volts ? "volts" : "raw");
 
   std::signal(SIGINT, on_interrupt);
@@ -690,8 +736,14 @@ constexpr std::string_view Commands = R"(Commands:
   reset                     every DIO pin back to INPUT, queue cleared
   time                      device millis/micros, reconstructed 64-bit clock,
                             and the round-trip-bounded host offset estimate
-  monitor [--hz N] [pins]   print levels/samples until Ctrl-C (set modes first)
-  stream <pins> [--hz N | --period-us N] [--seconds N] [--volts] [--csv FILE]
+  monitor [pins] [--hz N] [--volts] [--csv FILE|-]
+                            print levels/samples until Ctrl-C (set modes
+                            first); pins are comma-separated, all pins if
+                            omitted; --csv FILE also logs each refresh there
+                            as CSV (t_s,D<pin>,A<pin>,...), --csv - prints
+                            that CSV on stdout instead of the readout
+  stream <pins> [--hz N | --period-us N] [--seconds N] [--volts]
+         [--csv FILE|-]
                             continuous sampling over the bulk endpoint; pins
                             are comma-separated and must already be in
                             analog|input mode; CSV to stdout (or --csv FILE),
@@ -738,7 +790,8 @@ int run(int argc, char **argv) {
       cxxopts::value<unsigned>())(
       "seconds", "stream/watch duration; omit to run until Ctrl-C",
       cxxopts::value<double>())(
-      "csv", "stream: write CSV here instead of stdout",
+      "csv", "CSV destination file (- for stdout); stream: default stdout; "
+      "monitor: logged alongside the readout",
       cxxopts::value<std::string>())(
       "edge", "watch: edge(s) to report",
       cxxopts::value<std::string>()->default_value("change"))(
@@ -825,10 +878,10 @@ int run(int argc, char **argv) {
       {"sync", 0, "sync"},
       {"reset", 0, "reset"},
       {"time", 0, "time"},
-      {"monitor", 0, "monitor [--hz N] [pins...]"},
+      {"monitor", 0, "monitor [pins] [--hz N] [--volts] [--csv FILE|-]"},
       {"stream", 1,
        "stream <pins> [--hz N | --period-us N] [--seconds N] [--volts] "
-       "[--csv FILE]"},
+       "[--csv FILE|-]"},
       {"watch", 1,
        "watch <pins> [--edge rising|falling|change] [--debounce MS] "
        "[--seconds N]"},
