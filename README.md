@@ -511,6 +511,8 @@ Nano RP2040 Connect D24–D29) they are addressable, exactly as a sketch could
   there. Automatic WinUSB binding via MS OS 2.0 descriptors is a planned
   follow-up.
 
+To setup Zadig driver: install it with `winget install zadig`, run it, select the board's **UsbIo** interface, choose *WinUSB* and click *Install Driver*.
+
 ## Portenta H7 bring-up checklist
 
 1. `cmake --build build --target firmware-portenta` and upload (double-tap
