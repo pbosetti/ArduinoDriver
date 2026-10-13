@@ -1,0 +1,168 @@
+name: CLI release
+
+# On a version tag (v*), builds the arduino-io command line tool for
+# Windows x64, Linux x86_64 and arm64, and macOS (universal arm64 + x86_64),
+# zips each binary on its own and attaches the zips to the GitHub release
+# for that tag (created if it does not exist yet).
+#
+# The binaries are meant to run without extra installs:
+# - libusb is built from source and linked statically (the default,
+#   ARDUINODRIVER_SYSTEM_LIBUSB=OFF);
+# - Linux: built on Ubuntu 22.04 (glibc 2.35 baseline), libstdc++/libgcc
+#   linked statically, and libusb without udev so there is no libudev.so
+#   dependency (device enumeration falls back to sysfs; arduino-io does
+#   not use hotplug);
+# - macOS: deployment target 11.0; HAVE_PIPE2=0 stops libusb from using
+#   pipe2(), which newer SDKs declare but older macOS releases lack (the
+#   binary would crash there); libusb then uses pipe() + fcntl();
+# - Windows: static MSVC runtime, so no VC++ redistributable is needed.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # dry run: builds and uploads the zips as workflow artifacts only
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            exe: arduino-io.exe
+            cmake_args: >-
+              -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+              -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+              -DCMAKE_POLICY_DEFAULT_CMP0091=NEW
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            exe: arduino-io
+            cmake_args: >-
+              -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+              -DLIBUSB_ENABLE_UDEV=OFF
+              "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            exe: arduino-io
+            cmake_args: >-
+              -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+              -DLIBUSB_ENABLE_UDEV=OFF
+              "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+          - name: macos-universal
+            os: macos-latest
+            exe: arduino-io
+            cmake_args: >-
+              -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+              "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+              -DHAVE_PIPE2=0
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zip
+
+      - name: Install Ninja (macOS, Windows)
+        if: runner.os != 'Linux'
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # The tag on a release; dev-<sha> on a manual run. Passed to CMake
+      # explicitly: the shallow checkout has no tags for `git describe`.
+      - name: Version
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            version="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        run: |
+          cmake -S extras/driver -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DARDUINODRIVER_BUILD_TESTS=OFF \
+            -DARDUINODRIVER_BUILD_CLI=ON \
+            "-DARDUINODRIVER_VERSION_STRING=${{ steps.version.outputs.version }}" \
+            ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --target arduino-io
+
+      - name: Check the binary
+        run: |
+          bin="build/${{ matrix.exe }}"
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            strip "$bin"
+          fi
+          case "$RUNNER_OS" in
+            Linux)   ldd "$bin" ;;
+            macOS)
+              archs=" $(lipo -archs "$bin") "
+              echo "architectures:$archs"
+              [[ "$archs" == *" arm64 "* && "$archs" == *" x86_64 "* ]]
+              arch -x86_64 "$bin" --help > /dev/null # via Rosetta
+              ;;
+            Windows) dumpbin //dependents "$bin" ;;
+          esac
+          "$bin" --help > /dev/null
+          [ "$("$bin" --version | tr -d '\r')" = "arduino-io ${{ steps.version.outputs.version }}" ]
+
+      - name: Package
+        id: package
+        run: |
+          zip_name="arduino-io-${{ steps.version.outputs.version }}-${{ matrix.name }}.zip"
+          mkdir -p dist
+          cd build
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "../dist/${zip_name}" "${{ matrix.exe }}"
+          else
+            zip -9 "../dist/${zip_name}" "${{ matrix.exe }}"
+          fi
+          echo "zip=dist/${zip_name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arduino-io-${{ matrix.name }}
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: arduino-io-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
+          fi
+          gh release upload "$TAG" dist/*.zip --clobber

@@ -42,6 +42,12 @@ constexpr int ExitOk = 0;
 constexpr int ExitDevice = 1;
 constexpr int ExitUsage = 2;
 
+// Set by CMake (git describe, or the release tag); see CMakeLists.txt.
+#ifndef ARDUINO_IO_VERSION
+#define ARDUINO_IO_VERSION "unknown"
+#endif
+constexpr std::string_view Version = ARDUINO_IO_VERSION;
+
 /// Bad command line: message and exit code 2.
 class UsageError : public std::runtime_error {
 public:
@@ -798,6 +804,7 @@ int run(int argc, char **argv) {
       "debounce", "watch: debounce window, ms (0..255)",
       cxxopts::value<unsigned>()->default_value("0"))(
       "v,verbose", "libusb debug output on stderr")("h,help", "show this help")(
+      "version", "print the version and exit")(
       "args", "command and arguments",
       cxxopts::value<std::vector<std::string>>());
   options.parse_positional({"args"});
@@ -809,7 +816,11 @@ int run(int argc, char **argv) {
     throw UsageError(e.what());
   }
   if (parsed.count("help") != 0) {
-    fmt::print("{}\n{}", options.help(), Commands);
+    fmt::print("arduino-io {}\n\n{}\n{}", Version, options.help(), Commands);
+    return ExitOk;
+  }
+  if (parsed.count("version") != 0) {
+    fmt::print("arduino-io {}\n", Version);
     return ExitOk;
   }
 

@@ -163,6 +163,30 @@ if(ARDUINODRIVER_BUILD_CLI)
     fmt::fmt
     cxxopts::cxxopts)
 
+  # Version printed by `arduino-io --help` and `--version`. Unless set
+  # explicitly (the release workflow passes the tag), it is `git describe`
+  # of the checkout at configure time, or the project version outside git.
+  set(ARDUINODRIVER_VERSION_STRING "" CACHE STRING
+    "Version string embedded in arduino-io (empty: git describe)")
+  set(arduino_io_version "${ARDUINODRIVER_VERSION_STRING}")
+  if(NOT arduino_io_version)
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+      execute_process(
+        COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE arduino_io_version
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    endif()
+  endif()
+  if(NOT arduino_io_version)
+    set(arduino_io_version "v${PROJECT_VERSION}")
+  endif()
+  message(STATUS "ArduinoDriver: arduino-io version ${arduino_io_version}")
+  target_compile_definitions(arduino-io PRIVATE
+    ARDUINO_IO_VERSION="${arduino_io_version}")
+
   # `cmake --install build` puts the tool in <prefix>/bin. It links libusb
   # statically unless ARDUINODRIVER_SYSTEM_LIBUSB is ON, so it needs nothing
   # else from the build tree.
