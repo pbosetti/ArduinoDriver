@@ -355,7 +355,7 @@ inline bool pin_has_dac(uint8_t p) {
  * arduino:mbed_giga:giga, arduino:mbed_nano:nano33ble), NOT
  * arduino:zephyr_main:*. In the board selector, choose the board listed under
  * "Arduino Mbed OS ... Boards". */
-#error "UsbIo does not support the Arduino Zephyr core (arduino:zephyr_main:*). Select the same board from the 'Arduino Mbed OS ...' platform instead - the IDE shows both cores under identical names, so check the FQBN on the first line of the build log. Zephyr is blocked upstream, not just unimplemented: its prebuilt firmware exports neither usbd_init_device() nor usbd_device_register_vreq(), so no sketch can handle USB vendor requests. See README, 'Arduino Zephyr core'."
+#error "UsbIo does not support the Arduino Zephyr core (arduino:zephyr_main:*). Select the same board from the 'Arduino Mbed OS ...' platform instead - the IDE shows both cores under identical names, so check the FQBN on the first line of the build log. Up to release 1.0.0 the Zephyr core gives sketches no way to handle USB vendor requests; this is fixed upstream (arduino/ArduinoCore-zephyr#637, PR #695) and support will follow once a core release includes it. See README, 'Arduino Zephyr core'."
 
 #else
 #error "UsbIo: unsupported architecture. Supported cores: mbed (Portenta H7, GIGA R1, Nano 33 BLE, Nano RP2040 Connect), renesas_uno (UNO R4 Minima, Nano R4), samd (Zero, MKR, Nano 33 IoT), rp2040 and esp32 (both unverified). See the board-support table in the README."

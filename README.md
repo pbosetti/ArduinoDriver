@@ -479,6 +479,7 @@ is what anchors stream `t_us` and event `t_ms` to host time, to about ±RTT/2.
 | Nano 33 IoT | `arduino:samd:nano_33_iot` | compile-verified | 31 pins; AIN 14–21, DAC 14, PWM 2–6, 9–12, 16, 17, 19, 29, 30. NINA SPI lines 22–26 are addressable |
 | RP2040 / RP2350 (arduino-pico) | `rp2040:rp2040:*` | shim written, **unverified** | core not installed; see `transport/tinyusb_rp2040.cpp` |
 | ESP32-S2 / S3 (arduino-esp32) | `esp32:esp32:*` | shim written, **unverified** | needs *USB Mode: USB-OTG (TinyUSB)*; see `transport/esp32_vendor.cpp` |
+| Portenta H7, GIGA R1, Nano 33 BLE on the Zephyr core | `arduino:zephyr_main:*` | **not supported yet** | fixed upstream, waiting for a core release; see [Arduino Zephyr core](#arduino-zephyr-core) |
 | Teensy 4.x, STM32duino | – | deferred | no vendor-request hook; would need a patched core |
 | UNO R3, Mega, classic Nano | – | not possible | USB is a separate chip (16U2/CH340); the MCU that owns the pins has no USB |
 
@@ -491,6 +492,44 @@ analog header, on-board LEDs) plus one, never the core's full pad table, so a
 itself counts radio or USB-host control lines as digital pins (GIGA D92–D102,
 Nano RP2040 Connect D24–D29) they are addressable, exactly as a sketch could
 `pinMode()` them.
+
+### Arduino Zephyr core
+
+Arduino is moving the Portenta H7, GIGA R1 and Nano 33 BLE from the mbed core
+to a new Zephyr-based core (`arduino:zephyr_main:*`). The IDE lists both cores
+under the same board names. UsbIo works only with the **mbed** one for now. If
+a build stops with *"UsbIo does not support the Arduino Zephyr core"*, look at
+the FQBN on the first line of the build log and pick the board from the
+*Arduino Mbed OS … Boards* platform instead.
+
+**Why it does not work yet.** UsbIo needs the sketch to answer USB vendor
+control requests. Zephyr's USB stack can do this, and the core's prebuilt
+firmware has the feature compiled in (`CONFIG_USBD_VREQ_SUPPORT=y`). Up to
+release 1.0.0, though, the core did not export the functions a sketch needs to
+register a vendor request, so no library could use the feature.
+
+**Status.** We reported this as
+[arduino/ArduinoCore-zephyr#637](https://github.com/arduino/ArduinoCore-zephyr/issues/637).
+It was fixed by
+[PR #695](https://github.com/arduino/ArduinoCore-zephyr/pull/695), merged on
+2026-10-15. The PR exports `usbd_device_register_vreq()` and adds
+`usbd_get_context()`. The fix is **not in a release yet**: 1.0.0 (2026-09-02)
+is the latest. Updating the board package is probably not enough on its own.
+The export lives in the core's loader, so the board's loader firmware will
+likely need reflashing too.
+
+**Plan.** Once a release includes the fix, UsbIo will get a Zephyr transport:
+
+- It registers one vendor-request node per `bRequest` from a global
+  constructor. Zephyr rejects registration once USB is up, which happens
+  before `setup()`.
+- It routes every node into the same `UsbIo.handle_setup()` as the other
+  transports.
+- Zephyr cannot add the UsbIo vendor interface, so the host will find these
+  boards with the `GET_INFO` probe by vendor id, as it does for the UNO R4.
+
+Older cores will keep the current error, with a message naming the minimum
+core version.
 
 ## Operating-system notes
 
