@@ -233,7 +233,17 @@ Everything is reported by exceptions derived from `ArduinoDriver::Error`
 `ProtocolError`, `UsbError` …). `Device` validates pins and values locally
 before any USB traffic, so most mistakes fail fast with a precise message.
 
-### Python and R
+### 4. Realtime plotting
+
+Realtime plotting can be quickly done with the [complot](https://github.com/pbosetti/complot) multi-platform application. Once installed, you can for example do:
+
+```bash
+arduino-io mode 15 analog
+complot p1 --aes "x=t_us y=raw" # Create the plot window and set the aes mapping
+arduino-io stream --hz 10000 15 | complot p1: - # Stream the data to the plot window
+```
+
+## Python and R
 
 Both bindings wrap `arduino_driver_c` ([`extras/c_api`](extras/c_api)), a C
 ABI over the driver above, rather than linking the C++ API directly — a
